@@ -67,4 +67,5 @@ pub trait Cloud {
     fn bake(&mut self, key: &str) -> Result<String, Error>;
 }
 
+pub mod aws;
 pub mod fake;
