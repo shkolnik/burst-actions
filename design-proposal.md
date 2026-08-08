@@ -33,12 +33,21 @@ packaging — and every existing package fails at least one hard requirement:
 | Hosted runner vendors (WarpBuild, Namespace, …) | Rent their fleet | Vendor-existential risk (see BuildJet/Cirrus), and spot EC2 is ~2.7× cheaper than even GitHub's post-2026-price-cut hosted large runners, with the gap widening at larger sizes. |
 
 So: **build the small owned tool.** The pattern it implements is the same one every serious system
-above uses internally, which is exactly what makes a ~800-line version safe to own.
+above uses internally, which is exactly what makes a small owned implementation (a few thousand
+lines at most) safe to own.
 
 ## 2. The recommended design: `burst`
 
-A single Python file (`ci/burst.py`, boto3, no Terraform/Ansible/Packer anywhere), plus ~120 lines
-of bash + three systemd units baked into an AMI. **At idle there exists: one AMI + snapshot, one
+A single small Rust binary (`burst`, on `aws-sdk-rust`; no Terraform/Ansible/Packer anywhere),
+plus ~120 lines of bash + three systemd units baked into an AMI. **Language (decided — James,
+2026-08-08, over the earlier Python/boto3 sketch):** Rust. `aws-sdk-rust` is first-class (EC2,
+EventBridge Scheduler, IAM, STS all covered); a self-contained static binary is the most durable
+"works in two years untouched" distribution — no interpreter/venv drift, which is how
+twice-a-year Python tools rot; the cleanup design's failure-ordering logic is where the type
+system pays rent; and it's the house language. Two conditions carried from the original
+anti-Rust argument, which was really an argument against coupling the tool to a workspace it
+serves: **standalone crate, never a beep workspace member or xtask**, and **keep a prebuilt
+binary at hand** — "CI is broken" must never block launching more CI runners. **At idle there exists: one AMI + snapshot, one
 IAM role, one security group, (later, optional) one S3 cache bucket, and a $-budget alarm. Nothing
 executes; cost is pennies of EBS snapshot storage.**
 
@@ -236,7 +245,7 @@ Consequences propagated through this design:
 No webhook autoscaler; no always-on anything; no k8s; no Terraform/Ansible/Packer dependency; no
 separate bootstrap/install step (`ensure_substrate()` above — the tool is its own installer); no
 mid-flight rescaling; no multi-cloud *implementation* (a five-method
-`Cloud` seam — `launch / terminate / list_tagged / arm_kill / bake` — keeps the door open; GCP's
+`Cloud` trait — `launch / terminate / list_tagged / arm_kill / bake` — keeps the door open; GCP's
 native `max-run-duration` would even collapse layer 1 into the launch call, but a second backend is
 a 300-line class written when actually wanted, not before); no per-job microVMs; no dashboard
 (`burst status` prints text). The test applied to every exclusion: does its failure mode cost more
