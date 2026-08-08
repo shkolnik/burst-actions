@@ -66,7 +66,7 @@ impl TagSpec {
             (TAG_REPO.into(), self.repo.to_string()),
             (
                 TAG_EXPIRES.into(),
-                self.expires.to_rfc3339_opts(SecondsFormat::Secs, false),
+                self.expires.to_rfc3339_opts(SecondsFormat::Secs, true),
             ),
         ]
     }
@@ -145,7 +145,7 @@ mod tests {
             [
                 ("burst".into(), "1".into()),
                 ("burst-repo".into(), "octo/widgets".into()),
-                ("burst-expires".into(), "2026-08-08T18:00:00+00:00".into()),
+                ("burst-expires".into(), "2026-08-08T18:00:00Z".into()),
             ]
         );
     }
