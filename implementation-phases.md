@@ -14,10 +14,22 @@ is the one place the pieces must be reasoned about together.
 
 | Phase | Name | Verifies | Needs |
 |---|---|---|---|
+| 0 | Scaffolding | Crate builds/lints/formats clean; LSP works; dependabot+CI committed | Rust toolchain only |
 | 1 | Local core & contracts | Lock/state/config/key behavior on the compiled binary, offline | Rust toolchain only |
 | 2 | Substrate & image (rollout §7.1) | Fresh account → baked AMI; boot-to-registered < 2 min | AWS creds + GitHub PAT |
 | 3 | Fleet lifecycle & kill-testing (§7.2) | Every cleanup layer observed firing | Same + synthetic CI matrix |
 | 4 | First real burst & tuning (§7.3) | Wall-clock win vs serial baseline; §8 defaults tuned on evidence | A real benchmark matrix |
+
+## Phase 0 — Scaffolding
+
+Tooling on rails before feature work: cargo scaffold (edition 2024, Rust ≥ 1.89,
+`AGPL-3.0-only`, all phase-1 deps declared), lint policy in `[lints]`
+(forbid unsafe, warn on wildcard enum arms / dbg / todo), rustfmt + toolchain pin,
+rust-analyzer for the editor/agent LSP, dependabot (cargo + github-actions ecosystems) and a
+fmt/clippy/test CI workflow — both inert until the remote exists, live at first push.
+
+**Gate**: `cargo build && cargo test && cargo clippy --all-targets -- -D warnings && cargo fmt
+--check` clean on the committed tree; `rust-analyzer` present; YAML parses.
 
 ## Phase 1 — Local core & contracts
 
