@@ -130,9 +130,17 @@ then adopts: take the lock, reconcile the statefile against the cloud (file entr
 alive → drop; instances tagged `beep-burst-repo=<repo>` but absent from the file → adopt anyway —
 tags stay authoritative), resume watching, then execute its own command if compatible (`up N`
 composes: watch the adopted fleet AND launch N more). If incompatible, warn and keep the resumed
-watch. Known hole, accepted: the lock is per-machine; two *machines* bursting one repo aren't
-serialized, and the cloud side is already safe under that race (over-provisioned VMs die on the
-idle timeout; worst case is a wasteful double-bake).
+watch. **Cross-host concurrency is advisory, not locked** (James 2026-08-08): the hard lock is
+deliberately per-machine — broad adoption routes invocations through one automation environment
+anyway, and direct human/agent use is on small projects where collisions are rare and cheap.
+Instead, the startup cloud query that already drives adoption doubles as the cross-host signal:
+live instances tagged for this repo that aren't in this host's statefile → prompt "someone else
+appears to be running burst workers for this repo from another host — continue?" (`--yes` for
+automation). No new marker and no new permissions — and unlike a "running" flag planted anywhere,
+instances are self-cleaning, so the signal can never go stale into false positives. Accepted gap:
+another host mid-invocation that hasn't launched yet (baking/minting, a couple of minutes) is
+invisible; the collision outcome is the benign one (over-provisioned VMs die on the idle timeout,
+worst case a wasteful double-bake).
 
 On the VM, cloud-init arms watchdogs BEFORE starting the runner: a TTL-hour absolute-lifetime
 poweroff and a 10-minute registered-or-poweroff bootstrap deadline. Then the runner runs its one
@@ -275,7 +283,9 @@ All 2026-08-08, James:
 7. **Happy-path invocation is a long-running watcher** with a per-repo `flock` lockfile +
    manifest statefile; concurrent invocation fails fast; an abandoned run (statefile present,
    lock acquirable) is adopted and resumed by the next invocation. Watcher remains an observer —
-   killing it leaks nothing; Ctrl-C detaches, only `burst down` tears down.
+   killing it leaks nothing; Ctrl-C detaches, only `burst down` tears down. Cross-host
+   concurrency is advisory only: unrecognized live instances for the repo → confirm prompt
+   (`--yes` to skip), no cross-host lock, no new marker or permissions.
 8. **PAT expiry/invalidity fails loud** with a clear message; no rotation machinery.
 9. **vCPU-quota check**: warn when the account quota caps the fleet below the request.
 
