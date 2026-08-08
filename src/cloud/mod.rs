@@ -42,7 +42,7 @@ pub trait Cloud {
     /// Launch spec.count instances with spec.tags applied atomically at creation.
     fn launch(&mut self, spec: &LaunchSpec) -> Result<Vec<Instance>, Error>;
     fn terminate(&mut self, ids: &[String]) -> Result<(), Error>;
-    /// All non-terminated instances carrying burst=1 and burst-repo=<repo>.
+    /// All non-terminated instances carrying burst-actions=1 and burst-actions-repo=<repo>.
     fn list_tagged(&self, repo: &RepoId) -> Result<Vec<Instance>, Error>;
     /// Arm the control-plane one-shot kill for one instance at `at`.
     fn arm_kill(&mut self, instance_id: &str, at: DateTime<Utc>) -> Result<(), Error>;

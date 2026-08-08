@@ -118,7 +118,7 @@ mod tests {
         let listed = c
             .list_tagged(&RepoId::parse("octo/widgets").unwrap())
             .unwrap();
-        assert_eq!(listed.len(), 2, "must filter by burst-repo");
+        assert_eq!(listed.len(), 2, "must filter by burst-actions-repo");
     }
 
     #[test]
@@ -160,7 +160,7 @@ mod tests {
             .unwrap();
         assert!(
             listed.is_empty(),
-            "instance without burst=1 must not be listed: {listed:?}"
+            "instance without burst-actions=1 must not be listed: {listed:?}"
         );
     }
 

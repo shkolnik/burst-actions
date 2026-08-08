@@ -59,7 +59,7 @@ config are required inputs (the tool is project-agnostic — many repos use it, 
 Scheduler execution role), one security group, an opt-in budget alarm, and — phase 2 — one S3
 cache bucket. Nothing executes. Cost ≈ the snapshot: ~$1.25–2/month (§ image).
 
-**Zero pre-setup:** every standing resource is get-or-create under deterministic `burst-*`
+**Zero pre-setup:** every standing resource is get-or-create under deterministic `burst-actions-*`
 names — `ensure_substrate()` runs at the start of every invocation, so a fresh AWS account and the
 thousandth run are the same code path. A fresh account simply has no AMI, which is an image-cache
 miss: the first `burst up` bakes, then launches. Required inputs: AWS credentials (env/profile)
@@ -69,8 +69,8 @@ TOML block for instance type, timeouts, max fleet, region — all with working d
 ### Invariants
 
 1. **Scale to zero.** No daemon, webhook receiver, Lambda, or warm pool. Ever.
-2. **Tag or it doesn't exist.** Every instance carries `burst=1`,
-   `burst-repo=<owner/repo>`, and `burst-expires=<ISO8601>`, applied atomically inside
+2. **Tag or it doesn't exist.** Every instance carries `burst-actions=1`,
+   `burst-actions-repo=<owner/repo>`, and `burst-actions-expires=<ISO8601>`, applied atomically inside
    `RunInstances`. Anything tagged and past expiry is terminable by anyone without inspection.
    The cloud is the state; tags are the schema; the local statefile (below) is a manifest for UX
    and adoption, never a source of truth that can disagree with reality (also why no Terraform).
@@ -133,7 +133,7 @@ write-then-rename so a concurrent reader never sees a torn state. A second invoc
 lock is held **fails fast**. A crashed/killed process's flock evaporates with it, so "statefile
 present + lock acquirable" *is* the abandoned-run signal — no PID heuristics. The next invocation
 then adopts: take the lock, reconcile the statefile against the cloud (file entries no longer
-alive → drop; instances tagged `burst-repo=<repo>` but absent from the file → adopt anyway —
+alive → drop; instances tagged `burst-actions-repo=<repo>` but absent from the file → adopt anyway —
 tags stay authoritative), resume watching, then execute its own command if compatible (`up N`
 composes: watch the adopted fleet AND launch N more). If incompatible, warn and keep the resumed
 watch.
@@ -316,6 +316,11 @@ All 2026-08-08, James:
 10. **Genuinely open source is a hard requirement** ("find it or write it") — added after an
     adversarial review of RunsOn surfaced its closed server/agent; a follow-up OSS-only landscape
     sweep (`research/oss-landscape-sweep.md`) found no adoptable alternative, upholding build.
+11. **Naming family is `burst-actions`** (2026-08-08, James, during the IAM-policy review):
+    project/repo `burst-actions`; tags `burst-actions=1` / `burst-actions-repo` /
+    `burst-actions-expires`; AWS resource names `burst-actions-*`. The binary/crate stays
+    `burst` (typed constantly; the long form earns nothing at a shell prompt), as does the
+    `burst` routing label in `runs-on`.
 
 ## 7. Rollout
 

@@ -45,7 +45,7 @@ Everything that needs no cloud and no credentials; the parts later phases build 
 - Statefile + lock: `~/.local/state/burst/<owner>-<repo>/` flock lockfile, JSON statefile with
   write-then-rename, abandoned-run detection (statefile present + lock acquirable), adoption
   reconciliation logic (as pure functions over a `Cloud` view).
-- Schemas as types: tag triple (`burst=1` / `burst-repo` / `burst-expires`), image-cache key
+- Schemas as types: tag triple (`burst-actions=1` / `burst-actions-repo` / `burst-actions-expires`), image-cache key
   (hash of provisioning script ∥ base image ID ∥ arch ∥ agent version), instance lifecycle and
   cleanup-outcome enums, error taxonomy. Closed sets are enums matched exhaustively.
 - `Cloud` trait (`launch / terminate / list_tagged / arm_kill / bake`) + in-memory fake backend
@@ -72,7 +72,7 @@ needed to close this phase's stated gate.
   `instance-initiated-shutdown-behavior=terminate`, IMDSv2 required; `terminate`; `list_tagged`;
   EventBridge Scheduler one-shot `arm_kill` (`ActionAfterCompletion=DELETE`).
 - `ensure_substrate()`: get-or-create both IAM roles, security group (zero inbound), opt-in
-  budget alarm, under deterministic `burst-*` names; the IAM eventual-consistency retry (§5);
+  budget alarm, under deterministic `burst-actions-*` names; the IAM eventual-consistency retry (§5);
   fail-loud on missing default VPC (§8.7).
 - VM payload authored & baked: provisioning script (pinned Ubuntu LTS base per §8.6, toolchain,
   runner agent `--disableupdate`, browsers/X, VM agent), systemd units for the three on-VM

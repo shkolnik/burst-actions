@@ -3,9 +3,9 @@ use chrono::{DateTime, SecondsFormat, Utc};
 use sha2::{Digest, Sha256};
 use std::fmt;
 
-pub const TAG_BURST: &str = "burst";
-pub const TAG_REPO: &str = "burst-repo";
-pub const TAG_EXPIRES: &str = "burst-expires";
+pub const TAG_BURST: &str = "burst-actions";
+pub const TAG_REPO: &str = "burst-actions-repo";
+pub const TAG_EXPIRES: &str = "burst-actions-expires";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoId {
@@ -143,9 +143,12 @@ mod tests {
         assert_eq!(
             t.to_tags(),
             [
-                ("burst".into(), "1".into()),
-                ("burst-repo".into(), "octo/widgets".into()),
-                ("burst-expires".into(), "2026-08-08T18:00:00Z".into()),
+                ("burst-actions".into(), "1".into()),
+                ("burst-actions-repo".into(), "octo/widgets".into()),
+                (
+                    "burst-actions-expires".into(),
+                    "2026-08-08T18:00:00Z".into()
+                ),
             ]
         );
     }

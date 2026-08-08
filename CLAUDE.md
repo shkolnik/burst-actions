@@ -35,10 +35,10 @@ evidence and options, never a thing to silently redesign around. §8's defaults 
 
 - **Real money.** This tool creates EC2 instances, AMIs, snapshots, IAM roles, and schedules in a
   real AWS account. Every instance you create — including by-hand experiments and half-built code
-  paths — carries the three `burst-*` tags and an armed kill schedule *from launch*, exactly as
+  paths — carries the three `burst-actions-*` tags and an armed kill schedule *from launch*, exactly as
   invariant 2 demands; the discipline applies to your debugging instances before the tool
   enforces it for anyone. End every working session by running the sweep (or its manual
-  equivalent: list instances tagged `burst=1`, verify none should be alive) and say in your
+  equivalent: list instances tagged `burst-actions=1`, verify none should be alive) and say in your
   report that you did. Use the smallest instance type that exercises the code path when testing;
   the configured type is for real workloads.
 - **Credentials.** The GitHub PAT lives on the invoking machine only and must never reach a VM in
@@ -104,7 +104,7 @@ evidence and options, never a thing to silently redesign around. §8's defaults 
   never narrates history or demonstrates that you did the research. Evidence of verification
   goes in the commit message or a test that fails when the fact stops being true.
 - **Prove ownership before destroy.** Never terminate or delete by name-pattern or broad
-  listing; every destructive operation re-verifies the `burst-*` tag identity of the specific
+  listing; every destructive operation re-verifies the `burst-actions-*` tag identity of the specific
   resource immediately before acting. The failure mode — killing something in the account that
   isn't ours — is irreversible, so this holds even in throwaway debugging scripts.
 - **The environment is an undeclared dependency.** Probe for what you need (AWS credentials,
@@ -118,8 +118,8 @@ evidence and options, never a thing to silently redesign around. §8's defaults 
   runners.
 - Wire everything to the five-method `Cloud` trait seam (`launch / terminate / list_tagged /
   arm_kill / bake`) but build only the AWS backend.
-- Naming: binary and crate `burst`; AWS resources `burst-*`; tags `burst=1`,
-  `burst-repo=<owner/repo>`, `burst-expires=<ISO8601>`.
+- Naming: binary and crate `burst`; AWS resources `burst-actions-*`; tags `burst-actions=1`,
+  `burst-actions-repo=<owner/repo>`, `burst-actions-expires=<ISO8601>`.
 - Known wrinkles already researched (details in §5): IAM eventual consistency on fresh accounts
   (retry the specific invalid-role error); `--auto`'s label-filtered queue count is one API call
   per queued run, not one call total.

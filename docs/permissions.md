@@ -8,8 +8,8 @@ scope growth.
 
 ## AWS IAM policy (for the invoking user/role)
 
-Design principle: **everything mutating is fenced to burst-owned resources** — by the `burst=1`
-tag where the action supports tag conditions, by the `burst-*` name prefix where it doesn't
+Design principle: **everything mutating is fenced to burst-owned resources** — by the `burst-actions=1`
+tag where the action supports tag conditions, by the `burst-actions-*` name prefix where it doesn't
 (IAM, Scheduler, Budgets). Reads that AWS cannot resource-scope (`Describe*`) are the only `*`
 resources.
 
@@ -41,7 +41,7 @@ resources.
         "arn:aws:ec2:*:*:volume/*"
       ],
       "Condition": {
-        "StringEquals": { "aws:RequestTag/burst": "1" }
+        "StringEquals": { "aws:RequestTag/burst-actions": "1" }
       }
     },
     {
@@ -61,7 +61,7 @@ resources.
       "Action": "ec2:RunInstances",
       "Resource": "arn:aws:ec2:*:*:security-group/*",
       "Condition": {
-        "StringEquals": { "aws:ResourceTag/burst": "1" }
+        "StringEquals": { "aws:ResourceTag/burst-actions": "1" }
       }
     },
     {
@@ -72,7 +72,7 @@ resources.
       "Condition": {
         "StringEquals": {
           "ec2:CreateAction": ["RunInstances", "CreateImage", "CreateSecurityGroup"],
-          "aws:RequestTag/burst": "1"
+          "aws:RequestTag/burst-actions": "1"
         }
       }
     },
@@ -82,7 +82,7 @@ resources.
       "Action": "ec2:TerminateInstances",
       "Resource": "arn:aws:ec2:*:*:instance/*",
       "Condition": {
-        "StringEquals": { "aws:ResourceTag/burst": "1" }
+        "StringEquals": { "aws:ResourceTag/burst-actions": "1" }
       }
     },
     {
@@ -91,7 +91,7 @@ resources.
       "Action": "ec2:CreateImage",
       "Resource": "arn:aws:ec2:*:*:instance/*",
       "Condition": {
-        "StringEquals": { "aws:ResourceTag/burst": "1" }
+        "StringEquals": { "aws:ResourceTag/burst-actions": "1" }
       }
     },
     {
@@ -103,7 +103,7 @@ resources.
         "arn:aws:ec2:*:*:snapshot/*"
       ],
       "Condition": {
-        "StringEquals": { "aws:RequestTag/burst": "1" }
+        "StringEquals": { "aws:RequestTag/burst-actions": "1" }
       }
     },
     {
@@ -115,7 +115,7 @@ resources.
         "arn:aws:ec2:*:*:snapshot/*"
       ],
       "Condition": {
-        "StringEquals": { "aws:ResourceTag/burst": "1" }
+        "StringEquals": { "aws:ResourceTag/burst-actions": "1" }
       }
     },
     {
@@ -124,7 +124,7 @@ resources.
       "Action": "ec2:CreateSecurityGroup",
       "Resource": "arn:aws:ec2:*:*:security-group/*",
       "Condition": {
-        "StringEquals": { "aws:RequestTag/burst": "1" }
+        "StringEquals": { "aws:RequestTag/burst-actions": "1" }
       }
     },
     {
@@ -142,7 +142,7 @@ resources.
         "scheduler:DeleteSchedule",
         "scheduler:ListSchedules"
       ],
-      "Resource": "arn:aws:scheduler:*:*:schedule/default/burst-*"
+      "Resource": "arn:aws:scheduler:*:*:schedule/default/burst-actions-*"
     },
     {
       "Sid": "SubstrateRoles",
@@ -158,15 +158,15 @@ resources.
         "iam:AddRoleToInstanceProfile"
       ],
       "Resource": [
-        "arn:aws:iam::*:role/burst-*",
-        "arn:aws:iam::*:instance-profile/burst-*"
+        "arn:aws:iam::*:role/burst-actions-*",
+        "arn:aws:iam::*:instance-profile/burst-actions-*"
       ]
     },
     {
       "Sid": "PassOurRolesToTheirServices",
       "Effect": "Allow",
       "Action": "iam:PassRole",
-      "Resource": "arn:aws:iam::*:role/burst-*",
+      "Resource": "arn:aws:iam::*:role/burst-actions-*",
       "Condition": {
         "StringEquals": {
           "iam:PassedToService": ["ec2.amazonaws.com", "scheduler.amazonaws.com"]
@@ -183,7 +183,7 @@ resources.
       "Sid": "OptInBudgetAlarm",
       "Effect": "Allow",
       "Action": ["budgets:ViewBudget", "budgets:ModifyBudget"],
-      "Resource": "arn:aws:budgets::*:budget/burst-*"
+      "Resource": "arn:aws:budgets::*:budget/burst-actions-*"
     }
   ]
 }
@@ -200,13 +200,13 @@ What each statement serves:
 | Bake\* / DeleteSupersededImage | `burst bake` and one-generation image GC |
 | CreateZeroInboundSecurityGroup | `ensure_substrate()` (a new SG is zero-inbound by default; no rule-editing permission needed) |
 | OneShotKillSchedules | cleanup layer 1 |
-| SubstrateRoles / PassOurRoles | `ensure_substrate()`: the near-empty instance-profile role (trust: ec2) and the Scheduler execution role (trust: scheduler; policy: `TerminateInstances` where `burst=1`) |
+| SubstrateRoles / PassOurRoles | `ensure_substrate()`: the near-empty instance-profile role (trust: ec2) and the Scheduler execution role (trust: scheduler; policy: `TerminateInstances` where `burst-actions=1`) |
 | QuotaCheck | the vCPU-quota warning |
 | OptInBudgetAlarm | cleanup layer 5 (opt-in; omit this statement if declining the alarm) |
 
 ### Known limits, stated plainly
 
-- **The create/modify fence is the `burst=1` tag** (`aws:RequestTag` on creation,
+- **The create/modify fence is the `burst-actions=1` tag** (`aws:RequestTag` on creation,
   `aws:ResourceTag` on mutation): every resource this key creates must carry it, and the key can
   only terminate/delete/retag what carries it. Four launch-time *references* cannot be
   tag-fenced and stay open: the base AMI (Canonical's, untagged — needed to launch the bake
@@ -215,7 +215,7 @@ What each statement serves:
   reference *is* fenced — instances can only launch into the burst-tagged SG.
 
 - **`SubstrateRoles` + `PassRole` is the sharp edge.** `iam:CreateRole` + `iam:PutRolePolicy`
-  scoped to `burst-*` still lets the holder author a `burst-*` role with *any* inline policy and
+  scoped to `burst-actions-*` still lets the holder author a `burst-actions-*` role with *any* inline policy and
   hand it to EC2 — a privilege-escalation path if the credential leaks. Tag/name scoping cannot
   close it; only a [permissions boundary](https://docs.aws.amazon.com/IAM/latest/UserGuide/access_policies_boundaries.html)
   can (add `"Condition": {"StringEquals": {"iam:PermissionsBoundary": "<boundary-arn>"}}` to
@@ -224,7 +224,7 @@ What each statement serves:
   account owner.
 - The two roles the tool *creates* are separate from this policy and much smaller: the instance
   profile is near-empty (grows exactly one S3-prefix statement if phase-2 sccache lands); the
-  Scheduler role can only terminate `burst=1` instances.
+  Scheduler role can only terminate `burst-actions=1` instances.
 - Regional pinning: replace the `*` region in the ARNs with the configured region for a tighter
   fence; left `*` here since the region is user-config.
 

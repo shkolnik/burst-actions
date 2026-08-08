@@ -72,11 +72,11 @@ mod tests {
 
     fn inst(id: &str, state: InstanceState, expires: Option<&str>) -> Instance {
         let mut tags = vec![
-            ("burst".to_string(), "1".to_string()),
-            ("burst-repo".to_string(), "octo/widgets".to_string()),
+            ("burst-actions".to_string(), "1".to_string()),
+            ("burst-actions-repo".to_string(), "octo/widgets".to_string()),
         ];
         if let Some(e) = expires {
-            tags.push(("burst-expires".to_string(), e.to_string()));
+            tags.push(("burst-actions-expires".to_string(), e.to_string()));
         }
         Instance {
             id: id.into(),
