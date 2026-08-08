@@ -234,6 +234,28 @@ mod tests {
     }
 
     #[test]
+    fn write_replaces_the_file_so_a_reader_holding_the_old_one_is_unaffected() {
+        use std::io::Read;
+        let d = tempfile::tempdir().unwrap();
+        let rs = RepoState::open_at(d.path().to_path_buf());
+        rs.write(&sample()).unwrap();
+        // A concurrent reader that opened the statefile before the write.
+        let mut held = std::fs::File::open(d.path().join("state.json")).unwrap();
+        let mut two = sample();
+        two.instances.push(two.instances[0].clone());
+        rs.write(&two).unwrap();
+        let mut seen = String::new();
+        held.read_to_string(&mut seen).unwrap();
+        let old: StateFile = serde_json::from_str(&seen).expect("open reader sees whole JSON");
+        assert_eq!(
+            old.instances.len(),
+            1,
+            "write must replace the file by rename, never mutate the bytes an open reader is on"
+        );
+        assert_eq!(rs.read().unwrap().unwrap().instances.len(), 2);
+    }
+
+    #[test]
     fn corrupt_statefile_is_a_loud_error_not_empty() {
         let d = tempfile::tempdir().unwrap();
         let rs = RepoState::open_at(d.path().to_path_buf());
