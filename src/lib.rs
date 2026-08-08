@@ -2,5 +2,6 @@
 pub mod cloud;
 pub mod config;
 pub mod error;
+pub mod reconcile;
 pub mod schema;
 pub mod state;
