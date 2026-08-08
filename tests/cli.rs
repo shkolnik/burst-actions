@@ -1,9 +1,13 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::sync::LazyLock;
+use tempfile::TempDir;
+
+static SCRATCH: LazyLock<TempDir> = LazyLock::new(|| tempfile::tempdir().unwrap());
 
 fn burst() -> Command {
     let mut cmd = Command::cargo_bin("burst").unwrap();
-    cmd.current_dir(tempfile::tempdir().unwrap().keep());
+    cmd.current_dir(SCRATCH.path());
     cmd
 }
 
