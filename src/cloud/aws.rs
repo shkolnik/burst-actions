@@ -1,4 +1,42 @@
 use crate::error::Error;
+use aws_smithy_types::error::display::DisplayErrorContext;
+
+/// Substrings that, when found in the full error chain (or an AWS service
+/// error code), indicate the failure is a credentials/auth problem rather
+/// than some other API error — e.g. a `DescribeVpcs` dispatch failure with
+/// no credentials in the provider chain, or a service error like
+/// `InvalidClientTokenId` for a bad/expired key. Kept conservative: matching
+/// text appends the remedy, it never suppresses the underlying message.
+const CREDENTIAL_ERROR_MARKERS: &[&str] = &[
+    "credentials",
+    "InvalidClientTokenId",
+    "AuthFailure",
+    "UnrecognizedClientException",
+    "SignatureDoesNotMatch",
+    "ExpiredToken",
+];
+
+/// True if the full error text names a credentials/auth failure.
+fn is_credentials_error(full_message: &str) -> bool {
+    let lower = full_message.to_lowercase();
+    CREDENTIAL_ERROR_MARKERS
+        .iter()
+        .any(|marker| lower.contains(&marker.to_lowercase()))
+}
+
+/// Format an AWS SDK error for `Error::Aws { message, .. }`: walk the full
+/// `source()` chain (bare `Display`/`to_string()` on `SdkError` hides the
+/// underlying cause, e.g. `InvalidClientTokenId`) and, if the chain looks
+/// like a credentials/auth failure, append the specified remedy text. Single
+/// authoring site so every AWS call reports errors the same way.
+fn format_aws_error<E: std::error::Error + 'static>(err: &E) -> String {
+    let full = format!("{}", DisplayErrorContext(err));
+    if is_credentials_error(&full) {
+        format!("{full} (configure AWS credentials: env vars or `aws configure`)")
+    } else {
+        full
+    }
+}
 
 /// Live AWS context: a single-thread runtime plus the clients this crate needs.
 ///
@@ -88,7 +126,7 @@ impl AwsContext {
                 .await
                 .map_err(|e| Error::Aws {
                     op: "DescribeVpcs",
-                    message: e.to_string(),
+                    message: format_aws_error(&e),
                 })?;
 
             let region = self
@@ -126,7 +164,7 @@ impl AwsContext {
                 .await
                 .map_err(|e| Error::Aws {
                     op: "DescribeSubnets",
-                    message: e.to_string(),
+                    message: format_aws_error(&e),
                 })?;
 
             let mut by_az: Vec<_> = subnets
@@ -172,5 +210,84 @@ mod tests {
             effective_region(None, None),
             Err(Error::RegionMissing)
         ));
+    }
+
+    #[test]
+    fn detects_dispatch_failure_missing_credentials() {
+        assert!(is_credentials_error(
+            "dispatch failure: failed to load credentials from any provider in the chain"
+        ));
+    }
+
+    #[test]
+    fn detects_invalid_client_token_id() {
+        assert!(is_credentials_error(
+            "service error: InvalidClientTokenId: The security token included in the request is invalid"
+        ));
+    }
+
+    #[test]
+    fn detects_auth_failure_and_related_codes() {
+        for code in [
+            "AuthFailure",
+            "UnrecognizedClientException",
+            "SignatureDoesNotMatch",
+            "ExpiredToken",
+        ] {
+            assert!(is_credentials_error(code), "expected {code} to be detected");
+        }
+    }
+
+    #[test]
+    fn unrelated_error_is_not_a_credentials_error() {
+        assert!(!is_credentials_error(
+            "service error: InvalidVpcID.NotFound: vpc-1234 does not exist"
+        ));
+    }
+
+    #[derive(Debug)]
+    struct SourcedError {
+        message: &'static str,
+        source: Option<Box<SourcedError>>,
+    }
+
+    impl std::fmt::Display for SourcedError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "{}", self.message)
+        }
+    }
+
+    impl std::error::Error for SourcedError {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.source
+                .as_deref()
+                .map(|s| s as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn format_aws_error_surfaces_full_chain() {
+        let err = SourcedError {
+            message: "dispatch failure",
+            source: Some(Box::new(SourcedError {
+                message: "no credentials in the property bag",
+                source: None,
+            })),
+        };
+        let formatted = format_aws_error(&err);
+        assert!(formatted.contains("dispatch failure"));
+        assert!(formatted.contains("no credentials in the property bag"));
+        assert!(formatted.contains("configure AWS credentials: env vars or `aws configure`"));
+    }
+
+    #[test]
+    fn format_aws_error_leaves_non_credential_errors_unmodified() {
+        let err = SourcedError {
+            message: "service error: InvalidVpcID.NotFound",
+            source: None,
+        };
+        let formatted = format_aws_error(&err);
+        assert!(formatted.starts_with("service error: InvalidVpcID.NotFound"));
+        assert!(!formatted.contains("configure AWS credentials"));
     }
 }
