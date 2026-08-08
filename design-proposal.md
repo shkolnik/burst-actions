@@ -45,8 +45,9 @@ small owned implementation safe to own.
 
 ### Shape
 
-One standalone Rust binary, `burst` (on `aws-sdk-rust`), plus ~120 lines of bash + three systemd
-units baked into an AMI. Subcommands: `up [N|--auto] [--spot]`, `bake`, `status`, `down`, `sweep`.
+One standalone Rust binary, `burst` (on `aws-sdk-rust`), plus ~120 lines of bash and a handful of
+systemd units baked into the AMI (the VM-side runner service and the watchdog timers of cleanup
+layer 3). Subcommands: `up [N|--auto] [--spot]`, `bake`, `status`, `down`, `sweep`.
 **One invocation serves one GitHub repo**; the repo and its project-specific CI provisioning
 config are required inputs (the tool is project-agnostic — many repos use it, one at a time).
 
@@ -105,7 +106,8 @@ burst up N:
   RunInstances × N                # tags in TagSpecifications (no untagged window),
                                   #   instance-initiated-shutdown-behavior=terminate,
                                   #   JIT config in user-data, IMDSv2 required
-  arm N EventBridge Scheduler one-shots: TerminateInstances(id) at launch+TTL,
+  arm N EventBridge Scheduler one-shots: TerminateInstances(id) at launch+TTL
+                                  #   (TTL = hard instance lifetime, default 6 h — §8),
                                   #   ActionAfterCompletion=DELETE
   record instances in statefile
   watch                           # poll until every watched instance is gone, reporting
@@ -130,10 +132,12 @@ then adopts: take the lock, reconcile the statefile against the cloud (file entr
 alive → drop; instances tagged `beep-burst-repo=<repo>` but absent from the file → adopt anyway —
 tags stay authoritative), resume watching, then execute its own command if compatible (`up N`
 composes: watch the adopted fleet AND launch N more). If incompatible, warn and keep the resumed
-watch. **Cross-host concurrency is advisory, not locked** (James 2026-08-08): the hard lock is
+watch.
+
+**Cross-host concurrency is advisory, not locked** (James 2026-08-08): the hard lock is
 deliberately per-machine — broad adoption routes invocations through one automation environment
 anyway, and direct human/agent use is on small projects where collisions are rare and cheap.
-Instead, the startup cloud query that already drives adoption doubles as the cross-host signal:
+The startup cloud query that already drives adoption doubles as the cross-host signal:
 live instances tagged for this repo that aren't in this host's statefile → prompt "someone else
 appears to be running burst workers for this repo from another host — continue?" (`--yes` for
 automation). No new marker and no new permissions — and unlike a "running" flag planted anywhere,
@@ -142,8 +146,8 @@ another host mid-invocation that hasn't launched yet (baking/minting, a couple o
 invisible; the collision outcome is the benign one (over-provisioned VMs die on the idle timeout,
 worst case a wasteful double-bake).
 
-On the VM, cloud-init arms watchdogs BEFORE starting the runner: a TTL-hour absolute-lifetime
-poweroff and a 10-minute registered-or-poweroff bootstrap deadline. Then the runner runs its one
+On the VM, cloud-init arms watchdogs BEFORE starting the runner: an absolute-lifetime poweroff at
+the hard TTL and a 10-minute registered-or-poweroff bootstrap deadline. Then the runner runs its one
 job and exits → poweroff. A VM that boots into an already-drained queue (or whose labels match
 nothing) is caught by the never-assigned idle timeout → poweroff. Because of
 shutdown-behavior=terminate, **poweroff IS termination**: billing stops, and self-cleanup needs
@@ -205,7 +209,7 @@ carries the same tags and kill-schedule as any fleet VM.
   with a rebake — staleness never needs a warning.
 - **Known decay the key won't notice**: the baked `target/` drifts stale against main without
   changing the key; builds slow gradually until the next natural rebake. Properly fixed by the
-  phase-2 sccache tier; `--rebake` is the interim lever.
+  phase-2 sccache tier; an explicit `burst bake` is the interim lever.
 
 **Phase 2 — shared sccache (S3 backend, used by home runner and fleet):** keeps compile caches
 warm between bakes and across the fleet. Deferred until fleet build times are measured, but the
@@ -246,8 +250,8 @@ only; runner groups are org-scoped and add nothing here.
 - **Network:** zero-inbound security group (the runner long-polls outbound); no SSH keys by
   default (`--ssh-key` for debug sessions). Egress open: allow-listing was rejected — GitHub's
   CIDRs churn, benchmarks need the real web, and the fork-approval gate (invariant 5) carries the
-  trust load. If the beep egress-firewall design (D24/S6) later lands a posture, the fleet should
-  inherit it — flagged, not decided here.
+  trust load. If the beep-browser project's egress-firewall design (its decisions D24/S6, tracked
+  in that repo) later lands a posture, the fleet should inherit it — flagged, not decided here.
 - Perspective: the *home* runner — persistent, on the home LAN, accumulating state across jobs —
   is the scarier machine. Fleet VMs are fresh-imaged, isolated, and dead within hours.
 
@@ -269,6 +273,16 @@ what the first-principles doc's pro-Python argument was actually protecting; as 
 static binary, Rust is the more durable choice — no interpreter/venv drift, and the
 failure-ordering logic is where the type system pays rent.) `aws-sdk-rust` covers everything used:
 EC2, EventBridge Scheduler, IAM, STS, Budgets.
+
+Known first-run wrinkle: freshly created IAM roles are eventually consistent — a `RunInstances`
+or Scheduler call made seconds after `ensure_substrate()` creates a role can fail with an
+invalid-role error. Retry that specific error briefly rather than treating it as fatal; it only
+ever happens on a fresh account.
+
+`burst up --auto` needs a queued-job count filtered by label. GitHub's API exposes labels only at
+the per-job level (list queued workflow runs → list each run's jobs), so the count costs one API
+call per queued run — fine at this scale, but the implementation should not assume a single-call
+answer exists.
 
 ## 6. Decision log
 
@@ -312,3 +326,16 @@ Defaults awaiting a call (all cheap to change after first contact):
 5. **Region.** Default from the AWS profile; the AMI is region-bound, so a region change is a
    full cache miss (fine, just worth knowing). Spot capacity varies by region/AZ if `--spot` is
    used.
+6. **Base image pinning.** The image key includes the base image ID — so resolving "latest Ubuntu
+   LTS" at bake time means every upstream AMI refresh is a surprise rebake, while pinning an ID
+   means deliberate bumps (edit the pin in the provisioning config). Lean: pin; the config is
+   versioned anyway and surprise 15-minute bakes are exactly the latency this tool fights.
+7. **Accounts without a default VPC.** `ensure_substrate()` assumes a default VPC exists for the
+   subnet and security group. Fail loud with instructions, or create a `beep-burst` VPC? Lean:
+   fail loud — the target account has one, and VPC creation drags in subnets/routing/IGW, real
+   surface for a case we don't have.
+8. **Warming `target/` needs the repo source on the builder.** Public repos clone anonymously;
+   a private repo would put a read credential on the builder VM — tension with invariant 4
+   (mitigable: a short-lived fine-grained contents:read token, builder never runs untrusted
+   code). Decide when a private repo first uses the tool; until then the warm step is
+   public-clone or skip.
