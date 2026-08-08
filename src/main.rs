@@ -56,6 +56,22 @@ fn not_implemented(cmd: &str) -> ExitCode {
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
+
+    let cwd = match std::env::current_dir() {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+    let _config = match burst::config::load(&cwd, cli.repo.as_deref()) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::FAILURE;
+        }
+    };
+
     match cli.command {
         Cmd::Up { .. } => not_implemented("up"),
         Cmd::Bake => not_implemented("bake"),
