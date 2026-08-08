@@ -6,10 +6,10 @@ implementation.
 
 ## 1. Requirements
 
-James runs one fast persistent self-hosted GitHub Actions runner at home. Everyday CI fits it;
-heavy-but-parallelizable work (browser benchmarks, xvfb-static builds) is forced serial by it.
-Wanted: **one command** that launches cloud VMs as extra runners, lets them drain the job queue,
-then terminates and cleans up everything.
+The motivating setup (concrete but not special): one fast persistent self-hosted GitHub Actions
+runner at home. Everyday CI fits it; heavy-but-parallelizable work (browser-benchmark matrices,
+static-toolchain builds) is forced serial by it. Wanted: **one command** that launches cloud VMs
+as extra runners, lets them drain the job queue, then terminates and cleans up everything.
 
 Hard requirements:
 - **Scale to zero** — nothing runs and nothing bills (beyond pennies of storage) at idle.
@@ -59,7 +59,7 @@ config are required inputs (the tool is project-agnostic — many repos use it, 
 Scheduler execution role), one security group, an opt-in budget alarm, and — phase 2 — one S3
 cache bucket. Nothing executes. Cost ≈ the snapshot: ~$1.25–2/month (§ image).
 
-**Zero pre-setup:** every standing resource is get-or-create under deterministic `beep-burst-*`
+**Zero pre-setup:** every standing resource is get-or-create under deterministic `burst-*`
 names — `ensure_substrate()` runs at the start of every invocation, so a fresh AWS account and the
 thousandth run are the same code path. A fresh account simply has no AMI, which is an image-cache
 miss: the first `burst up` bakes, then launches. Required inputs: AWS credentials (env/profile)
@@ -69,8 +69,8 @@ TOML block for instance type, timeouts, max fleet, region — all with working d
 ### Invariants
 
 1. **Scale to zero.** No daemon, webhook receiver, Lambda, or warm pool. Ever.
-2. **Tag or it doesn't exist.** Every instance carries `beep-burst=1`,
-   `beep-burst-repo=<owner/repo>`, and `beep-burst-expires=<ISO8601>`, applied atomically inside
+2. **Tag or it doesn't exist.** Every instance carries `burst=1`,
+   `burst-repo=<owner/repo>`, and `burst-expires=<ISO8601>`, applied atomically inside
    `RunInstances`. Anything tagged and past expiry is terminable by anyone without inspection.
    The cloud is the state; tags are the schema; the local statefile (below) is a manifest for UX
    and adoption, never a source of truth that can disagree with reality (also why no Terraform).
@@ -133,7 +133,7 @@ write-then-rename so a concurrent reader never sees a torn state. A second invoc
 lock is held **fails fast**. A crashed/killed process's flock evaporates with it, so "statefile
 present + lock acquirable" *is* the abandoned-run signal — no PID heuristics. The next invocation
 then adopts: take the lock, reconcile the statefile against the cloud (file entries no longer
-alive → drop; instances tagged `beep-burst-repo=<repo>` but absent from the file → adopt anyway —
+alive → drop; instances tagged `burst-repo=<repo>` but absent from the file → adopt anyway —
 tags stay authoritative), resume watching, then execute its own command if compatible (`up N`
 composes: watch the adopted fleet AND launch N more). If incompatible, warn and keep the resumed
 watch.
@@ -254,8 +254,8 @@ only; runner groups are org-scoped and add nothing here.
 - **Network:** zero-inbound security group (the runner long-polls outbound); no SSH keys by
   default (`--ssh-key` for debug sessions). Egress open: allow-listing was rejected — GitHub's
   CIDRs churn, benchmarks need the real web, and the fork-approval gate (invariant 5) carries the
-  trust load. If the beep-browser project's egress-firewall design (its decisions D24/S6, tracked
-  in that repo) later lands a posture, the fleet should inherit it — flagged, not decided here.
+  trust load. If the operator later adopts an egress policy elsewhere in their infrastructure,
+  the fleet should inherit it — flagged as future work, not decided here.
 - Perspective: the *home* runner — persistent, on the home LAN, accumulating state across jobs —
   is the scarier machine. Fleet VMs are fresh-imaged, isolated, and dead within hours.
 
@@ -271,8 +271,8 @@ failure mode cost more maintainer attention than its absence costs money or risk
 
 ## 5. Implementation notes
 
-Rust, standalone crate — **never a beep workspace member or xtask** — and keep a prebuilt binary
-at hand: "CI is broken" must never block launching more CI runners. (A Python script was the
+Rust, standalone crate in its own repo — **never a workspace member of any consumer project** —
+and keep a prebuilt binary at hand: "CI is broken" must never block launching more CI runners. (A Python script was the
 considered alternative; its real virtue — always runnable regardless of any repo's build health —
 is preserved by those two rules, and a standalone static binary is the more durable form of it:
 no interpreter/venv drift, and the failure-ordering logic is where the type system pays rent.)
@@ -287,6 +287,13 @@ ever happens on a fresh account.
 the per-job level (list queued workflow runs → list each run's jobs), so the count costs one API
 call per queued run — fine at this scale, but the implementation should not assume a single-call
 answer exists.
+
+**Reference reading before/while implementing** (found by the landscape sweeps, see `research/`):
+**testflows/testflows-github-hetzner-runners** for the single-process one-VM-per-job watcher
+model (closest existing tool in spirit — wrong cloud, right shape), and
+**CloudSnorkel/cdk-github-runners** for AWS-specific edge cases its history has already fought
+(launch-time tagging races, instances dying before the agent installs, retry policy). Read for
+lessons; import no code.
 
 ## 6. Decision log
 
@@ -336,12 +343,11 @@ none blocks rollout step 1:
    used.
 6. **Base image pinning.** The image key includes the base image ID — so resolving "latest Ubuntu
    LTS" at bake time means every upstream AMI refresh is a surprise rebake, while pinning an ID
-   means deliberate bumps (edit the pin in the provisioning config). Lean: pin; the config is
+   means deliberate bumps (edit the pin in the provisioning config). Default: pin; the config is
    versioned anyway and surprise 15-minute bakes are exactly the latency this tool fights.
 7. **Accounts without a default VPC.** `ensure_substrate()` assumes a default VPC exists for the
-   subnet and security group. Fail loud with instructions, or create a `beep-burst` VPC? Lean:
-   fail loud — the target account has one, and VPC creation drags in subnets/routing/IGW, real
-   surface for a case we don't have.
+   subnet and security group. Default: fail loud with instructions — the target account has one,
+   and VPC creation drags in subnets/routing/IGW, real surface for a case we don't have.
 8. **Warming `target/` needs the repo source on the builder.** Public repos clone anonymously;
    a private repo would put a read credential on the builder VM — tension with invariant 4
    (mitigable: a short-lived fine-grained contents:read token, builder never runs untrusted

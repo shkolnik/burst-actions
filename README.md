@@ -1,20 +1,19 @@
-# burst-runners
+# burst-actions
 
-On-demand ephemeral cloud VMs as GitHub Actions self-hosted runners: one command launches a fleet
-from a prebaked image, the fleet drains the job queue, then unregisters, terminates, and provably
-cleans up. Scale-to-zero, no standing infrastructure, no AWS account pre-setup, no
-Terraform/Ansible.
+On-demand ephemeral cloud VMs as GitHub Actions self-hosted runners: one command (`burst up`)
+launches a fleet from a prebaked AMI, the fleet drains the job queue one job per VM, then
+unregisters, terminates, and provably cleans up. Scale-to-zero, no standing infrastructure, no
+AWS account pre-setup, no Terraform/Ansible, genuinely open source.
 
-Not specific to any one repo — it applies to beep-browser CI (where the need surfaced:
-heavy-but-parallelizable benchmark and xvfb-static pipelines forced serial on one home runner) but
-is a general tool.
+Built for the solo maintainer whose one fast home runner handles everyday CI but forces
+heavy-parallelizable pipelines (benchmark matrices, big build fans) to run serial. Not specific
+to any one repo — one invocation serves one repo; many repos use the tool.
 
-- `design-proposal.md` — **start here.** The consolidated design + recommendation (status:
-  proposal, awaiting James's read; open calls in its §3/§5).
-- `research/` — the three commissioned takes the proposal synthesizes:
-  - `homelab-landscape.md` — what homelab/solo users use for cloud-burst CI (Sonnet, web research)
-  - `gha-ecosystem.md` — GitHub primitives + autoscaler project assessments (Sonnet, web research)
-  - `first-principles-design.md` — from-scratch design, no research required (Fable)
+| File | What it is |
+|---|---|
+| `CLAUDE.md` | Onboarding for the working agent — read first in a fresh session. |
+| `design-proposal.md` | **The approved design.** Requirements, landscape verdict, full design, decision log, rollout plan, starting defaults. |
+| `research/` | Preserved research: the three original commissioned takes (`homelab-landscape.md`, `gha-ecosystem.md`, `first-principles-design.md`), the adversarial buy-vs-build review (`adversarial-runson-review.md`), and the OSS-only landscape sweep (`oss-landscape-sweep.md`). The design proposal supersedes all of them where they disagree. |
 
-This directory is a temporary home; it may become a standalone project repo or move elsewhere.
-Working context/memory for this effort lives with the beep-browser project.
+Status: design approved 2026-08-08; implementation not yet started (rollout plan in
+`design-proposal.md` §7).
