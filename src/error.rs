@@ -17,4 +17,17 @@ pub enum Error {
     },
     #[error("no repository: pass --repo owner/repo or set repo in burst.toml")]
     RepoMissing,
+    #[error("state file {path}: {source}", path = .path.display())]
+    State {
+        path: std::path::PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("state file {path} is corrupt ({reason}) — if no burst fleet is live, delete it; if one is, run burst status", path = .path.display())]
+    StateCorrupt {
+        path: std::path::PathBuf,
+        reason: String,
+    },
+    #[error("{reason}")]
+    Environment { reason: String },
 }
