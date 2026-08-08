@@ -136,8 +136,11 @@ which is protected by the identical tag/kill-schedule layers. No Packer, no Ansi
 
 **Keep the AMI between runs; rebake only when the config changes (decided over delete-after-run,
 James + review 2026-08-08).** The idle cost is the backing EBS snapshot: $0.05/GB-month for
-written blocks, ~25–40 GB for this image → **$1.25–2/month per kept generation, ≤$4/month keeping
-two** (current + previous for rollback; prune older). Delete-after-run would save that ~$2–4/month
+written blocks, ~25–40 GB for this image → **$1.25–2/month for the one kept generation** (James:
+keep ONE — the provisioning config is versioned, so the image is reproducible by rebake; a
+previous-generation rollback copy earns its keep only in extreme cases like an apt package
+vanishing from the repo, and we don't pay for that until it actually happens). Delete-after-run
+would save that ~$2/month
 by putting a 10–20 min serial bake in front of *every* burst before the first worker takes its
 first job — with one-VM-per-job ephemeral runners (§3), fleet startup latency is the whole game,
 so this is the easiest call in the document. Mechanism — the AMI is a build cache, same
@@ -146,8 +149,9 @@ tags-are-the-schema pattern as everything else:
 - **Key** = hash(provisioning script ∥ base image ID ∥ arch ∥ runner agent version), stamped on
   the AMI as `beep-burst-image-key=<hash>` at bake time.
 - **`burst up`** computes the key, looks the AMI up by tag: hit → launch immediately (the common
-  case, ~90s to registered workers); miss → bake inline, tag, launch, prune generations >2.
-  `burst bake` remains as an explicit subcommand only for forced rebakes.
+  case, ~90s to registered workers); miss → bake inline, tag, launch, delete the superseded AMI +
+  snapshot once the new one is registered. `burst bake` remains as an explicit subcommand only for
+  forced rebakes.
 - **The agent-version key term is the staleness correctness floor** (research catch): GitHub stops
   dispatching to runner agents ≳30 days old and we bake `--disableupdate`. The CLI resolves the
   current runner release at `up` time, so each new agent release (~monthly) changes the key and
