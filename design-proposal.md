@@ -1,268 +1,282 @@
 # Burst CI runners — design proposal
 
-**Status: PROPOSAL, awaiting James's read.** Nothing here is built.
+**Status: PROPOSAL.** Major axes decided (§6); nothing built. Open questions in §8.
 
-The need (James, 2026-08-08): the single persistent self-hosted runner is right for everyday CI, but
-heavy-parallelizable work (browser benchmarks, xvfb-static) is forced serial by it. Wanted: **one
-command** that launches cloud VMs from a predefined CI image, registers them as GitHub Actions
-runners, lets them drain the queue, then unregisters, terminates, and cleans up everything —
-**scale-to-zero** when idle, cleanup **guaranteed** not best-effort, simple and durable for years.
-AWS preferred; cross-cloud a bonus. Mature existing tool preferred over invention — but a small
-owned script beats an enterprise system. Additional constraints (James, same day): Terraform/Tofu
-and Ansible exist in the homelab but are disfavored — don't depend on them; and (litmus test)
-**minimal-to-no pre-setup of the AWS account** — the tool should work given only AWS + GitHub
-credentials with the necessary permissions, with configuration beyond that optional, not required.
+## 1. Requirements
 
-This doc synthesizes three independent takes commissioned for it: a homelab-ecosystem survey, a
-GitHub-Actions-ecosystem survey, and a from-scratch first-principles design.
+James runs one fast persistent self-hosted GitHub Actions runner at home. Everyday CI fits it;
+heavy-but-parallelizable work (browser benchmarks, xvfb-static builds) is forced serial by it.
+Wanted: **one command** that launches cloud VMs as extra runners, lets them drain the job queue,
+then terminates and cleans up everything.
 
----
+Hard requirements:
+- **Scale to zero** — nothing runs and nothing bills (beyond pennies of storage) at idle.
+- **Cleanup guaranteed, not best-effort** — no leaked VMs, regardless of what fails mid-run.
+- **Operationally simple and durable** — solo maintainer, understandable in one sitting, must
+  still work in two years untouched.
+- **Zero AWS account pre-setup** — works given only AWS + GitHub credentials; everything else the
+  tool creates itself. Configuration beyond credentials is optional.
+- **No Terraform/Ansible dependency** (available in the homelab, disfavored).
+- AWS first; cross-cloud a bonus. Prefer a mature existing tool over invention — but a small owned
+  tool beats an enterprise system.
 
-## 1. Verdict on the existing-tool landscape: nothing mature fits; the *pattern* is mature
+This doc synthesizes three commissioned takes (see `research/`): a homelab-ecosystem survey, a
+GitHub-Actions-ecosystem survey, and a first-principles design.
 
-All three takes, arriving independently, converged on the same core mechanism (§3). What differs is
-packaging — and every existing package fails at least one hard requirement:
+## 2. Landscape verdict: build; RunsOn is the buy-fallback
+
+All three takes converged on the same core mechanism (ephemeral runners + prebaked image +
+instance self-termination + independent kill switch). Every existing *package* of it fails a hard
+requirement:
 
 | Option | What it is | Why not |
 |---|---|---|
-| **actions-runner-controller** (GitHub-official) | k8s controller, ephemeral runner pods | Needs a k8s cluster running 24/7. A full-time platform for a part-time problem. |
-| **philips-labs / github-aws-runners terraform-aws-github-runner** | Lambda+SQS webhook autoscaler, Terraform | Multi-Lambda standing control plane, Terraform-dependent, built for sustained team volume; original repo archived Jan 2025 and migrated orgs mid-flight — churn we don't need. |
-| **GARM** (cloudbase) | Single Go daemon, multi-cloud pools | A daemon to run and babysit forever. (Interesting twist: it could live on the existing always-on runner box. Still rejected — it's a standing service whose failure modes accrue while nobody watches, to automate a demand signal the human already has.) |
-| **machulav/ec2-github-runner**, **ubergeek77/aws-ec2-spot-runner** | GitHub Actions steps that start/stop EC2 from *within* a workflow | Right spirit (zero standing infra), wrong lifecycle: runner lifetime is tied to one workflow run, and cleanup rides on a `stop` job that a cancelled run can skip. Our need is "drain a queue across runs," not "bootstrap one run's runner." Kept as reference implementations. |
-| **RunsOn** (runs-on.com) | CloudFormation stack in your own AWS account; per-job ephemeral VMs; free for non-commercial/OSS | The credible **buy** option: no k8s, scale-to-zero, actively developed through 2026, no vendor-hosted control plane (BuildJet and Cirrus CI both died in H1 2026 — self-hosting in our own account is the only vendor-risk-free shape). Rejected as first choice only because it's a third party's control-plane code running with EC2 rights in our account and the small owned alternative exists (its per-job ephemeral-VM granularity, initially a mark against it, is in fact the model we adopted — §3). **Named fallback:** if the DIY tool palls, adopt RunsOn rather than growing the script. |
-| Hosted runner vendors (WarpBuild, Namespace, …) | Rent their fleet | Vendor-existential risk (see BuildJet/Cirrus), and spot EC2 is ~2.7× cheaper than even GitHub's post-2026-price-cut hosted large runners, with the gap widening at larger sizes. |
+| **actions-runner-controller** (GitHub-official) | k8s controller, runner pods | Needs a k8s cluster running 24/7. |
+| **terraform-aws-github-runner** (ex-philips-labs) | Lambda+SQS webhook autoscaler | Standing multi-Lambda control plane, Terraform-based, built for sustained team volume; repo archived/migrated orgs in 2025. |
+| **GARM** (cloudbase) | Multi-cloud pool daemon | An always-on service to babysit, automating a demand signal the human already has. |
+| **machulav/ec2-github-runner**, **ubergeek77/aws-ec2-spot-runner** | Workflow steps that start/stop EC2 | Zero standing infra (right spirit), but runner lifetime is tied to one workflow run and cleanup rides on a `stop` job a cancelled run can skip. Kept as reference implementations. |
+| **RunsOn** (runs-on.com) | CloudFormation stack in your own account; per-job ephemeral VMs; free for non-commercial | The credible buy option: no k8s, scale-to-zero, actively maintained, no vendor-hosted control plane. Rejected only because it's third-party code holding EC2 rights in our account and the small owned alternative exists. **Fallback: if the DIY tool palls, adopt RunsOn rather than growing it.** |
+| Hosted vendors (WarpBuild, Namespace, …) | Rent their fleet | Vendor-existential risk (BuildJet and Cirrus CI both died H1 2026); spot EC2 is ~2.7× cheaper than GitHub's hosted large runners. |
 
-So: **build the small owned tool.** The pattern it implements is the same one every serious system
-above uses internally, which is exactly what makes a small owned implementation (a few thousand
-lines at most) safe to own.
+The pattern is the same one every serious system above uses internally — which is what makes a
+small owned implementation safe to own.
 
-## 2. The recommended design: `burst`
+## 3. Design
 
-A single small Rust binary (`burst`, on `aws-sdk-rust`; no Terraform/Ansible/Packer anywhere),
-plus ~120 lines of bash + three systemd units baked into an AMI. **Language (decided — James,
-2026-08-08, over the earlier Python/boto3 sketch):** Rust. `aws-sdk-rust` is first-class (EC2,
-EventBridge Scheduler, IAM, STS all covered); a self-contained static binary is the most durable
-"works in two years untouched" distribution — no interpreter/venv drift, which is how
-twice-a-year Python tools rot; the cleanup design's failure-ordering logic is where the type
-system pays rent; and it's the house language. Two conditions carried from the original
-anti-Rust argument, which was really an argument against coupling the tool to a workspace it
-serves: **standalone crate, never a beep workspace member or xtask**, and **keep a prebuilt
-binary at hand** — "CI is broken" must never block launching more CI runners. **At idle there exists: one AMI + snapshot, one
-IAM role, one security group, (later, optional) one S3 cache bucket, and a $-budget alarm. Nothing
-executes; cost is pennies of EBS snapshot storage.**
+### Shape
 
-**Zero pre-setup:** every one of those standing resources is created by the tool itself,
-idempotently, under deterministic names (`beep-burst-*`). Each `burst` invocation begins with
-`ensure_substrate()` — get-or-create the role, instance profile, security group, and (opt-in)
-budget alarm; a fresh account has no AMI, which is just an image-cache miss (see The image), so the
-first `burst up` bakes then launches, and that is the entire onboarding. This falls straight out of invariant 2: names/tags are the schema and the
-cloud is queried for what exists, so "first run on a fresh account" and "thousandth run" are the
-same code path — get-or-create, not a bootstrap script and not IaC state. Configuration is a small
-optional `[burst]` TOML block (instance type, idle timeout, max fleet, region) with working
-defaults; the required inputs are exactly two credentials: AWS (env/profile) and the GitHub PAT.
+One standalone Rust binary, `burst` (on `aws-sdk-rust`), plus ~120 lines of bash + three systemd
+units baked into an AMI. Subcommands: `up [N|--auto] [--spot]`, `bake`, `status`, `down`, `sweep`.
 
-The five invariants (from the first-principles design, adopted verbatim in spirit):
+**At idle there exists:** one AMI + its EBS snapshot, two IAM roles (instance profile; EventBridge
+Scheduler execution role), one security group, an opt-in budget alarm, and — phase 2 — one S3
+cache bucket. Nothing executes. Cost ≈ the snapshot: ~$1.25–2/month (§ image).
 
-1. **Scale to zero** — no daemon, no webhook receiver, no Lambda, no warm pool. Ever.
-2. **Tag or it doesn't exist** — every instance carries `beep-burst=1` and
-   `beep-burst-expires=<ISO8601>`, applied atomically in `RunInstances`. Anything so tagged past
-   expiry is terminable by anyone without inspection. **The cloud is the state; tags are the
-   schema; there is no state file to disagree with reality** (this is also why no Terraform).
-3. **Termination needs no cooperation** — the deepest cleanup layer is pure AWS control plane;
-   no cleanup path requires the VM's OS, the GitHub API, or the launching script to be alive.
-4. **The VM never holds a credential that outlives it or exceeds it.**
-5. **Untrusted code never reaches a runner** — fork-PR workflows require explicit approval
-   before any job runs; `burst up` hard-errors if the repo's Actions approval setting is weaker
-   (labels route jobs, they are not a trust boundary — a fork can edit `runs-on:`).
+**Zero pre-setup:** every standing resource is get-or-create under deterministic `beep-burst-*`
+names — `ensure_substrate()` runs at the start of every invocation, so a fresh AWS account and the
+thousandth run are the same code path. A fresh account simply has no AMI, which is an image-cache
+miss: the first `burst up` bakes, then launches. Required inputs: AWS credentials (env/profile)
+and a GitHub fine-grained PAT (self-hosted-runners:write on the target repo). Optional `[burst]`
+TOML block for instance type, timeouts, max fleet, region — all with working defaults.
 
-### Lifecycle — the VM is self-managing
+### Invariants
+
+1. **Scale to zero.** No daemon, webhook receiver, Lambda, or warm pool. Ever.
+2. **Tag or it doesn't exist.** Every instance carries `beep-burst=1` and
+   `beep-burst-expires=<ISO8601>`, applied atomically inside `RunInstances`. Anything tagged and
+   past expiry is terminable by anyone without inspection. The cloud is the state; tags are the
+   schema; no state file exists to disagree with reality (also why no Terraform).
+3. **Termination needs no cooperation.** No cleanup path requires the VM's OS, the GitHub API, or
+   the launching CLI to be alive.
+4. **A VM never holds a credential that outlives it or exceeds it.** Its only GitHub material is
+   a single-use JIT config; its instance profile is scoped to (eventually) one S3 prefix.
+5. **Untrusted code never reaches a runner.** Labels route jobs but are not a trust boundary — a
+   fork can edit `runs-on:`. The repo's Actions setting must require approval for outside
+   collaborators' workflows; `burst up` hard-errors if it's weaker.
+
+### Registration: JIT + ephemeral, one VM per job
+
+Each runner is registered via GitHub's `generate-jitconfig` API: the CLI (holding the PAT, which
+never leaves the dev machine) mints one single-use blob per VM; the runner starts as
+`run.sh --jitconfig <blob>`, makes zero registration API calls, executes **exactly one job**, and
+GitHub deregisters it automatically. One VM = one runner = one job = one boot (~60–90s from a
+prebaked AMI — the cost that makes this trade acceptable).
+
+Rejected alternatives: a classic registration token with multi-job runners (carries a ≤1h token
+on the VM that could register rogue runners against the repo); JIT with on-VM re-minting (puts a
+minting credential on a machine that executes CI code — worse than what JIT avoids).
+
+What this buys beyond the credential story: GitHub-side registration GC is automatic (the sweep
+only covers runners that never connected), and every job gets a fresh filesystem.
+
+### Lifecycle
 
 ```
 burst up N:
-  sweep()                         # cleanup is rent paid on entry, every invocation
+  ensure_substrate()              # get-or-create roles / SG / alarm (idempotent)
+  sweep()                         # reap anything expired — rent paid on entry
   check fork-approval setting     # invariant 5
-  mint N JIT configs (§3)         # PAT never leaves the dev machine; each blob
-                                  #   registers exactly one runner, once
-  RunInstances × N                #   prebaked AMI, tags in TagSpecifications,
-                                  #   instance-initiated-shutdown-behavior=terminate
-  arm per-instance EventBridge Scheduler one-shot: TerminateInstances at launch+6h,
-                                  #   ActionAfterCompletion=DELETE (self-deleting)
-  exit                            # the CLI is NOT a supervisor; killing it leaks nothing
+  ensure AMI (image-cache key)    # hit → proceed; miss → bake inline
+  mint N JIT configs
+  RunInstances × N                # tags in TagSpecifications (no untagged window),
+                                  #   instance-initiated-shutdown-behavior=terminate,
+                                  #   JIT config in user-data, IMDSv2 required
+  arm N EventBridge Scheduler one-shots: TerminateInstances(id) at launch+TTL,
+                                  #   ActionAfterCompletion=DELETE
+  exit                            # the CLI is not a supervisor; killing it leaks nothing
 ```
 
-On the VM (cloud-init, all armed BEFORE the runner starts): a 6-hour absolute-lifetime
-`systemd-run` poweroff; a 10-minute registered-or-poweroff bootstrap deadline; then
-`run.sh --jitconfig <blob>` (§3 — ephemeral, `--disableupdate` baked at image time). The runner
-takes at most one job; when the process exits — job done, or never assigned within the idle
-timeout — the VM powers off. Because shutdown-behavior=terminate, **`poweroff` IS termination and
-billing stops — self-cleanup requires zero IAM permissions on the VM.**
+On the VM, cloud-init arms watchdogs BEFORE starting the runner: a TTL-hour absolute-lifetime
+poweroff and a 10-minute registered-or-poweroff bootstrap deadline. Then the runner runs its one
+job and exits → poweroff. A VM that boots into an already-drained queue (or whose labels match
+nothing) is caught by the never-assigned idle timeout → poweroff. Because of
+shutdown-behavior=terminate, **poweroff IS termination**: billing stops, and self-cleanup needs
+zero IAM permissions on the VM.
 
-"Queue is empty" is never queried: with one-job ephemeral runners the fleet is sized to the queue
-at launch (§3), each VM dies with its job, and a VM that boots into a drained queue dies on the
-never-assigned idle timeout. A GitHub-unreachable partition is indistinguishable from an empty
-queue and produces the same, correct outcome: the VM dies.
+The queue is never polled to decide shutdown: the fleet is sized to the queue at launch, each VM
+dies with its job, and a GitHub-unreachable partition is indistinguishable from an empty queue —
+same correct outcome, the VM dies. (Why self-managing: an external decider must stay alive, reach
+both APIs, and infer remote state — three failure surfaces, one violating scale-to-zero. The VM
+needs local facts and a syscall.)
 
-Why self-managing rather than an external manager: an external decider must stay alive, reach both
-APIs, and correctly infer remote state — three failure surfaces, one of which violates
-scale-to-zero. The VM deciding its own death needs local facts and a syscall.
+### Cleanup: defense in depth, ranked by reliability
 
-### Cleanup: five independent layers, ranked by reliability
+1. **EventBridge Scheduler one-shot kill at launch+TTL** — pure AWS control plane; survives
+   kernel hang, GitHub outage, CLI death, vacation; self-deletes after firing. (The research
+   reports prescribe a standing scheduled reaper here; the per-instance one-shot gives the same
+   guarantee with nothing standing.)
+2. **`instance-initiated-shutdown-behavior=terminate`** — set before boot; the instance profile
+   can't call ModifyInstanceAttribute, so nothing on the VM can undo it.
+3. **On-VM systemd timers** — bootstrap deadline, never-assigned idle timeout, TTL cap.
+4. **Sweep on every invocation** — terminate tagged-and-expired instances, delete orphan
+   schedules, delete never-connected runner registrations. Idempotent; driven entirely by tags.
+5. **Budget alarm (opt-in, ~$15/mo threshold)** — not a cleanup layer; the tripwire ensuring a
+   bug in all four costs days of pennies, not a month of silence.
 
-1. **EventBridge Scheduler one-shot kill at launch+6h** — pure control plane; survives kernel
-   hang, GitHub outage, CLI death, vacation. Self-deletes after firing. (Adjudication note: both
-   research reports prescribe a *standing* scheduled reaper Lambda here; the per-instance
-   self-deleting one-shot achieves the same guarantee with nothing standing — adopted instead.)
-2. **`instance-initiated-shutdown-behavior=terminate`** — set before boot; unremovable from
-   inside (the instance role can't call ModifyInstanceAttribute); turns every OS poweroff into
-   termination.
-3. **On-VM systemd timers** — 10-min never-registered deadline, 6h cap, 1-min idle check.
-4. **Sweep on every `burst` invocation** — terminate tagged-and-expired instances, delete orphan
-   schedules, delete offline `burst-*` runner registrations (with §3's ephemeral runners, GitHub
-   GCs completed-job registrations itself — the sweep covers only the never-connected case).
-   Idempotent; needs no memory of who launched what.
-5. **AWS Budget alarm (~$15/mo)** — not a cleanup layer; the tripwire that a bug in all four
-   costs days of pennies, not a month of silence. (Orphaned registrations are cosmetic, never
-   billing; GitHub also ages them out on its own.)
+Failure modes and which layer catches them: CLI killed mid-launch → 2/3/4 (and tagging is atomic
+with launch, so no untagged window); cloud-init or registration failure → bootstrap deadline;
+kernel wedge → 1; hung job → TTL cap, then 1 (GitHub marks the job failed when the runner
+vanishes — correct for a hung job); cancelled workflow → runner exits jobless → idle timeout;
+GitHub API down at launch → JIT minting fails before any instance exists, clean abort; spot
+reclaim → job fails visibly, instance terminates natively; sweep API errors → retried next
+invocation, layer 1 is per-instance and independent; user never runs burst again → 1–3 are all
+user-independent. Orphaned runner *registrations* are cosmetic, never billing; the sweep deletes
+them and GitHub ages them out anyway.
 
-Every failure mode in the first-principles doc's table (CLI killed mid-launch, cloud-init hang,
-kernel wedge, hung job, cancelled workflow, token expiry, spot reclaim, API errors during sweep,
-user never runs burst again) is caught by at least one user-independent layer.
+### The image: a content-addressed cache, one generation
+
+Boot-time dependency install would add 5–10 min to every VM — exactly the latency this tool
+exists to remove — so CI dependencies are baked into an AMI, built by the tool itself (no
+Packer/Ansible): launch a builder from stock Ubuntu/Debian, run the version-controlled
+provisioning script (toolchain, runner agent, browsers, X stack, VM agent + units), optionally
+warm `target/` via `cargo build` against main, `CreateImage`, terminate the builder. The builder
+carries the same tags and kill-schedule as any fleet VM.
+
+**The AMI persists between runs and rebakes only when its inputs change:**
+
+- **Key** = hash(provisioning script ∥ base image ID ∥ arch ∥ runner agent version), stamped as a
+  tag on the AMI.
+- **`burst up`**: key hit → launch (~90s to registered workers, the common case); miss → bake
+  inline (10–20 min), tag, launch, delete the superseded AMI + snapshot. `burst bake` forces it.
+- **One generation kept** (config is versioned, so the image is reproducible; a rollback copy
+  would insure only against extremes like an apt package vanishing upstream — don't pay until it
+  happens). Idle cost: $0.05/GB-month × ~25–40 GB written blocks ≈ **$1.25–2/month**.
+  Delete-after-run was rejected: it saves that ~$2/month by putting a serial bake in front of
+  every burst.
+- **The agent-version key term doubles as the staleness guard**: GitHub stops dispatching to
+  runner agents ≳30 days old, and the image bakes `--disableupdate`. The CLI resolves the current
+  agent release at `up` time, so each release (~monthly) is a cache miss and the fleet self-heals
+  with a rebake — staleness never needs a warning.
+- **Known decay the key won't notice**: the baked `target/` drifts stale against main without
+  changing the key; builds slow gradually until the next natural rebake. Properly fixed by the
+  phase-2 sccache tier; `--rebake` is the interim lever.
+
+**Phase 2 — shared sccache (S3 backend, used by home runner and fleet):** keeps compile caches
+warm between bakes and across the fleet. Deferred until fleet build times are measured, but the
+one-job-per-VM model raises its expected value: there is no job-to-job cache reuse on a VM, so
+every job starts from the baked `target/` alone.
+
+### Fleet sizing and economics
+
+**N independent VMs, one runner each — never one big box:** GitHub parallelism is per-runner
+anyway; browser benchmarks fight over displays, ports, and CPU when co-tenanted; N common-size
+instances launch more reliably than one rare 64-vCPU one; one failure costs 1/N.
+
+With one job per VM, N is the number of queued jobs: `burst up --auto` counts queued
+burst-labeled jobs (capped at `max_fleet`, default 12) — the primary UX; `burst up N` covers
+launching ahead of a push. No mid-flight rescaling: grow by running `up` again; shrink is
+automatic. Under-provisioning is benign — leftover jobs fall to the home runner or a second `up`.
+
+**On-demand by default, `--spot` opt-in:** loop latency is the stated priority, and a spot
+reclaim mid-benchmark taxes the loop to save single-digit dollars a month. `--spot` fits long
+parametric sweeps where a lost shard is cheap to re-run.
 
 ### Routing and coexistence with the home runner
 
-Burst-eligible workflows declare `runs-on: [self-hosted, burst]`. The home runner carries
-`[self-hosted, linux, x64, home, burst]` — it also accepts burst work, so one stray benchmark job
-never strands when no fleet is up. Everyday CI targets `home`, which burst VMs don't carry, so the
-fleet never steals the fast path. Labels only; runner groups are org-scoped and add nothing here.
+Burst-eligible jobs declare `runs-on: [self-hosted, burst]`. The home runner carries
+`[self-hosted, linux, x64, home, burst]` — it also accepts burst work, so a stray benchmark job
+never strands when no fleet is up (and because a registered runner with the `burst` label always
+exists, GitHub queues such jobs rather than failing them for want of a matching runner). Everyday
+CI targets `home`, which fleet VMs don't carry, so the fleet never steals the fast path. Labels
+only; runner groups are org-scoped and add nothing here.
 
-### The image: prebaked, built by the tool itself, kept and reused as a content-addressed cache
+### Security
 
-Boot-time install costs 5–10 min of exactly the latency this tool exists to remove. The bake:
-launch one instance from stock Ubuntu/Debian, run the version-controlled provisioning script
-(toolchain, runner agent, browsers, X stack, the VM agent + units), optionally `cargo fetch &&
-cargo build` against main for a warm `target/`, snapshot via CreateImage, terminate the builder —
-which is protected by the identical tag/kill-schedule layers. No Packer, no Ansible.
-
-**Keep the AMI between runs; rebake only when the config changes (decided over delete-after-run,
-James + review 2026-08-08).** The idle cost is the backing EBS snapshot: $0.05/GB-month for
-written blocks, ~25–40 GB for this image → **$1.25–2/month for the one kept generation** (James:
-keep ONE — the provisioning config is versioned, so the image is reproducible by rebake; a
-previous-generation rollback copy earns its keep only in extreme cases like an apt package
-vanishing from the repo, and we don't pay for that until it actually happens). Delete-after-run
-would save that ~$2/month
-by putting a 10–20 min serial bake in front of *every* burst before the first worker takes its
-first job — with one-VM-per-job ephemeral runners (§3), fleet startup latency is the whole game,
-so this is the easiest call in the document. Mechanism — the AMI is a build cache, same
-tags-are-the-schema pattern as everything else:
-
-- **Key** = hash(provisioning script ∥ base image ID ∥ arch ∥ runner agent version), stamped on
-  the AMI as `beep-burst-image-key=<hash>` at bake time.
-- **`burst up`** computes the key, looks the AMI up by tag: hit → launch immediately (the common
-  case, ~90s to registered workers); miss → bake inline, tag, launch, delete the superseded AMI +
-  snapshot once the new one is registered. `burst bake` remains as an explicit subcommand only for
-  forced rebakes.
-- **The agent-version key term is the staleness correctness floor** (research catch): GitHub stops
-  dispatching to runner agents ≳30 days old and we bake `--disableupdate`. The CLI resolves the
-  current runner release at `up` time, so each new agent release (~monthly) changes the key and
-  the next burst self-heals with a fresh bake — staleness is a cache miss, not a warning to act on.
-- **Known decay the key won't notice:** the baked warm `target/` drifts stale against
-  `main`/`Cargo.lock` without changing the key — builds slow gradually until an agent-release
-  rebake. Covered properly by the phase-2 sccache tier; `--rebake` (or an age term in the key) is
-  the cheap interim lever if it bites first.
-
-**Cache warmth, phase 2:** sccache with an S3 backend shared by home runner and fleet keeps builds
-warm *between* bakes and makes AMI staleness degrade gracefully. Deferred — measure fleet build
-times with the baked-`target/` tier first; don't stand up the bucket until the pain is shown.
-
-### Concurrency and instance economics
-
-**N independent VMs, one runner each** — never one big box: GitHub parallelism is per-runner
-anyway; browser benchmarks fight over displays/ports/CPU when co-tenanted; N common-size instances
-launch more reliably than one rare 64-vCPU one; one failure costs 1/N. With one job per VM (§3),
-N is sized to the matrix: `--auto` (N = queued burst-labeled jobs, capped at `max_fleet=12`) is
-the primary UX; explicit `burst up N` covers launching ahead of a push. No mid-flight rescaling:
-grow by running `up` again; shrink is automatic — each VM dies with its job. **On-demand by default, `--spot` opt-in**: loop latency is the
-stated priority, and a spot reclaim mid-benchmark taxes the loop to save single-digit dollars per
-month; `--spot` is right for long parametric sweeps where a lost shard is cheap.
-
-### Security posture
-
-- **PAT** (fine-grained, single-repo, self-hosted-runners:write) lives on the dev machine only —
-  never on any VM.
-- **On the VM**: only its single-use JIT config blob (registers exactly one runner, once — §3)
-  and an instance profile scoped
-  to nothing (until sccache lands: RW on one S3 prefix only). No SSH keys by default (`--ssh-key`
-  for debug sessions). Security group: **zero inbound**; the runner long-polls outbound.
-- Egress allow-listing rejected for now: GitHub's CIDRs churn, benchmarks need the real web, and
-  the fork-approval gate carries the trust load. (Reserved-adjacent: if the egress-firewall design
-  (D24/S6) later lands a posture, the fleet should inherit it — flagged, not decided here.)
-- Worth saying out loud: the *home* runner — persistent, on the home LAN, state accumulating
-  across jobs — is the scarier machine. The fleet is fresh-imaged, isolated, dead in hours.
-
-## 3. Registration mode: JIT + ephemeral, one VM per job (decided)
-
-The takes disagreed here. The two research reports recommend GitHub's **JIT config**
-(`generate-jitconfig`): a single-use, pre-scoped blob; the runner starts with
-`run.sh --jitconfig <blob>`, makes zero registration API calls, and **no token capable of
-registering anything ever touches the VM**. JIT runners are ephemeral by construction — one job,
-then GitHub deregisters them itself. The first-principles design instead chose a classic
-registration token with non-ephemeral multi-job runners, to avoid paying a VM boot per job.
-
-**DECIDED (James, 2026-08-08): JIT + ephemeral, one VM per job.** The boot-per-job cost is
-acceptable *provided the AMI is prebaked* — CI dependencies baked in and reused across all jobs,
-never apt-get-the-world at boot — which the §2 image already guarantees (~60–90s VM startup +
-registration per job). The rejected alternatives, for the record: (a) registration token +
-non-ephemeral multi-job runners — carries a ≤1h token on the VM that could register rogue runners
-against the repo; (b) JIT with the VM minting fresh configs mid-life — puts a minting credential
-on a machine that executes CI code, strictly worse than what JIT avoids.
-
-What the decision buys:
-- **Credentials:** the only GitHub material ever on a VM is a single-use blob that registers
-  exactly one pre-named, pre-labeled runner. No registration-capable token window at all —
-  invariant 4 at its strongest.
-- **Deregistration:** GitHub GCs an ephemeral runner's registration itself after its job; the
-  sweep's runner-cleanup duty shrinks to the never-connected case.
-- **Job isolation:** every job gets a fresh filesystem; no cross-job state accumulates.
-
-Consequences propagated through this design:
-- **Lifecycle:** a runner that finishes its one job exits immediately → poweroff → terminate. The
-  idle timeout's remaining role is the **never-assigned** case — a VM that boots into an
-  already-drained queue (or with mismatched labels) dies after T instead of waiting forever — so
-  it can be shorter (proposed 10 min).
-- **Sizing:** one VM serves one job, so `burst up` is sized to the matrix: N ≈ queued
-  burst-labeled jobs, which is exactly what `--auto` computes (capped at `max_fleet`). Explicit
-  `burst up N` remains for launching ahead of a push you're about to make. Under-provisioning is
-  benign: leftover jobs fall to the home runner (which also carries `burst`) or a second
-  `burst up`.
-- **Cache warmth matters more:** with no job-to-job reuse on a VM, every job starts from the
-  AMI's baked `target/` — raising the expected value of the phase-2 shared sccache tier (still
-  deferred until measured, but likely wanted sooner).
-- **Mid-job VM death** (spot reclaim, TTL kill of a hung job): unchanged — job fails visibly,
-  registration GC'd.
+- **PAT** on the dev machine only, never on a VM. On a VM: one single-use JIT config (in
+  user-data; IMDSv2 enforced) and the near-empty instance profile.
+- **Network:** zero-inbound security group (the runner long-polls outbound); no SSH keys by
+  default (`--ssh-key` for debug sessions). Egress open: allow-listing was rejected — GitHub's
+  CIDRs churn, benchmarks need the real web, and the fork-approval gate (invariant 5) carries the
+  trust load. If the beep egress-firewall design (D24/S6) later lands a posture, the fleet should
+  inherit it — flagged, not decided here.
+- Perspective: the *home* runner — persistent, on the home LAN, accumulating state across jobs —
+  is the scarier machine. Fleet VMs are fresh-imaged, isolated, and dead within hours.
 
 ## 4. What we are explicitly NOT building
 
-No webhook autoscaler; no always-on anything; no k8s; no Terraform/Ansible/Packer dependency; no
-separate bootstrap/install step (`ensure_substrate()` above — the tool is its own installer); no
-mid-flight rescaling; no multi-cloud *implementation* (a five-method
-`Cloud` trait — `launch / terminate / list_tagged / arm_kill / bake` — keeps the door open; GCP's
-native `max-run-duration` would even collapse layer 1 into the launch call, but a second backend is
-a 300-line class written when actually wanted, not before); no per-job microVMs; no dashboard
-(`burst status` prints text). The test applied to every exclusion: does its failure mode cost more
-maintainer attention than its absence costs money or risk?
+No webhook autoscaler; no always-on anything; no k8s; no Terraform/Ansible/Packer; no separate
+bootstrap step (the tool is its own installer); no mid-flight rescaling; no per-job microVMs; no
+dashboard (`burst status` prints text). Multi-cloud stays a seam, not an implementation: a
+five-method `Cloud` trait (`launch / terminate / list_tagged / arm_kill / bake`) keeps the door
+open — GCP's native `max-run-duration` would even collapse cleanup layer 1 into the launch call —
+but a second backend gets written when wanted, not before. The test for every exclusion: does its
+failure mode cost more maintainer attention than its absence costs money or risk?
 
-## 5. Rollout
+## 5. Implementation notes
 
-1. **`burst bake` v1** (which exercises `ensure_substrate()` on the fresh account — there is no
-   separate bootstrap step): provisioning script + first AMI; verify boot-to-registered <2 min.
-2. **`burst up/down/status/sweep` v1**: launch against a synthetic queued matrix; then kill-test
-   every cleanup layer deliberately (kill the CLI mid-launch, boot a broken AMI, hang a job,
-   cancel a run mid-flight) and watch each layer catch its case — the layers are only real once
-   each has been observed firing.
-3. **First real burst**: a browser-benchmark matrix on `runs-on: [self-hosted, burst]`, measured
+Rust, standalone crate — **never a beep workspace member or xtask** — and keep a prebuilt binary
+at hand: "CI is broken" must never block launching more CI runners. (These two rules preserve
+what the first-principles doc's pro-Python argument was actually protecting; as a standalone
+static binary, Rust is the more durable choice — no interpreter/venv drift, and the
+failure-ordering logic is where the type system pays rent.) `aws-sdk-rust` covers everything used:
+EC2, EventBridge Scheduler, IAM, STS, Budgets.
+
+## 6. Decision log
+
+All 2026-08-08, James:
+1. **Build** the owned tool; RunsOn is the named fallback.
+2. **JIT + ephemeral, one VM per job** (boot cost acceptable given a prebaked AMI).
+3. **AMI kept between runs**, content-addressed by config hash; **one generation**.
+4. **Rust** (`aws-sdk-rust`), standalone crate.
+5. Zero AWS pre-setup; no Terraform/Ansible (litmus tests from the original request).
+
+## 7. Rollout
+
+1. **`burst bake` v1** — exercises `ensure_substrate()` on the fresh account; verify
+   boot-to-registered < 2 min.
+2. **`burst up/down/status/sweep` v1** — launch against a synthetic queued matrix, then
+   deliberately kill-test every cleanup layer (kill the CLI mid-launch, boot a broken AMI, hang a
+   job, cancel a run mid-flight) and watch each layer catch its case. The layers are only real
+   once each has been observed firing.
+3. **First real burst** — a browser-benchmark matrix on `runs-on: [self-hosted, burst]`, measured
    against the serial baseline.
 
-**Open calls for James** (registration mode is decided — §3): (1) never-assigned idle-timeout and
-hard-TTL defaults — proposed 10 min / 6 h; (2) instance type for benchmarks (lean: c7i.2xlarge-class,
-benchmarks may want bare-metal-ish consistency — measure first); (3) sccache S3 tier now or after
-measuring (lean: after, but §3 raises its expected value — no job-to-job cache reuse on a VM).
+## 8. Open questions
+
+Defaults awaiting a call (all cheap to change after first contact):
+1. **Timeouts** — never-assigned idle timeout 10 min; hard TTL 6 h.
+2. **Instance type** — lean c7i.2xlarge-class; benchmarks may want bare-metal-ish consistency —
+   measure first. Related: root gp3 volume size/IOPS for browser workloads.
+3. **sccache tier** — now or after measuring (lean: after, but §3 raises its value).
+
+Latent — likely to surface at execution time, no design change expected but each needs an answer:
+4. **Multi-repo scope.** The repos live under a personal account, and org-level runners don't
+   exist for user accounts — so registration is per-repo. If burst serves both the main repo and
+   the benchmarks repo, the config needs a repo list, `--auto` must count queues across them, and
+   each VM's JIT config pins it to one repo. Fleet-splitting heuristic when both have queued work?
+5. **Arch.** x86_64 assumed (parity with the home runner matters for benchmark comparability);
+   Graviton is cheaper if a workload is ever arch-agnostic. The image key already includes arch.
+6. **EC2 vCPU quota.** A fresh account's on-demand vCPU quota can cap the fleet below
+   `max_fleet`. `burst up` should detect the quota and say so rather than half-launching silently.
+7. **Concurrent invocations.** Two `burst up`s racing is mostly benign (sweep is idempotent;
+   over-provisioned VMs die on the idle timeout) but a simultaneous image-cache miss double-bakes
+   — wasteful, not harmful. Accept or add a cheap bake lock (e.g. conditional tag write)?
+8. **PAT lifetime.** Fine-grained PATs expire (max 1 year); the tool should fail with a clear
+   "token expired, rotate it" rather than an opaque 401. A GitHub App would auto-rotate but adds
+   setup — against the zero-pre-setup litmus. Accept annual manual rotation?
+9. **Region.** Default from the AWS profile; the AMI is region-bound, so a region change is a
+   full cache miss (fine, just worth knowing). Spot capacity varies by region/AZ if `--spot` is
+   used.
+10. **Provisioning config location.** The tool is project-agnostic; each project supplies its
+    provisioning script + `[burst]` block. Where does discovery happen — a path flag, a
+    well-known file in the invoking repo, or both?
