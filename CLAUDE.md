@@ -145,6 +145,5 @@ a credential on a VM beyond the JIT config. Frame such items as options + a lean
   gate); per-phase task plans live in `docs/plans/`. Execution model: subagent-driven
   development — Sonnet/Opus subagents implement tasks by clarity/complexity, Fable leads and
   reviews whole-branch / high-importance gates.
-- Keep this CLAUDE.md current as the project grows a real structure (crate layout, build/test
-  commands, CI). Replace this Housekeeping section with real onboarding (build commands, test
-  invocations, environment notes) as soon as those exist.
+- Build: `cargo build`. Test: `cargo test`. Lint: `cargo clippy --all-targets -- -D warnings`.
+  Format check: `cargo fmt --check`. Run all four before every commit.
