@@ -45,8 +45,8 @@ executes; cost is pennies of EBS snapshot storage.**
 **Zero pre-setup:** every one of those standing resources is created by the tool itself,
 idempotently, under deterministic names (`beep-burst-*`). Each `burst` invocation begins with
 `ensure_substrate()` — get-or-create the role, instance profile, security group, and (opt-in)
-budget alarm; `burst up` on an AMI-less account tells you to run `burst bake` first, and that is
-the entire onboarding. This falls straight out of invariant 2: names/tags are the schema and the
+budget alarm; a fresh account has no AMI, which is just an image-cache miss (see The image), so the
+first `burst up` bakes then launches, and that is the entire onboarding. This falls straight out of invariant 2: names/tags are the schema and the
 cloud is queried for what exists, so "first run on a fresh account" and "thousandth run" are the
 same code path — get-or-create, not a bootstrap script and not IaC state. Configuration is a small
 optional `[burst]` TOML block (instance type, idle timeout, max fleet, region) with working
@@ -126,20 +126,36 @@ Burst-eligible workflows declare `runs-on: [self-hosted, burst]`. The home runne
 never strands when no fleet is up. Everyday CI targets `home`, which burst VMs don't carry, so the
 fleet never steals the fast path. Labels only; runner groups are org-scoped and add nothing here.
 
-### The image: prebaked, built by the tool itself
+### The image: prebaked, built by the tool itself, kept and reused as a content-addressed cache
 
-Boot-time install costs 5–10 min of exactly the latency this tool exists to remove. `burst bake`
-launches one instance from stock Ubuntu/Debian, runs the version-controlled provisioning script
+Boot-time install costs 5–10 min of exactly the latency this tool exists to remove. The bake:
+launch one instance from stock Ubuntu/Debian, run the version-controlled provisioning script
 (toolchain, runner agent, browsers, X stack, the VM agent + units), optionally `cargo fetch &&
-cargo build` against main for a warm `target/`, snapshots via CreateImage, keeps the last two AMIs,
-terminates the builder — which is protected by the identical tag/kill-schedule layers. No Packer,
-no Ansible.
+cargo build` against main for a warm `target/`, snapshot via CreateImage, terminate the builder —
+which is protected by the identical tag/kill-schedule layers. No Packer, no Ansible.
 
-**Bake cadence is a correctness floor, not just latency** (research catch the first-principles
-design missed): GitHub stops dispatching jobs to runner agents ≳30 days old, and we run
-`--disableupdate` (an ephemeral VM should not spend boot time self-updating). So `burst up` warns
-when the AMI's baked agent is >21 days old, and the failure mode "fleet boots but receives
-nothing" is pre-empted rather than debugged. Rebake monthly-ish or on warn.
+**Keep the AMI between runs; rebake only when the config changes (decided over delete-after-run,
+James + review 2026-08-08).** The idle cost is the backing EBS snapshot: $0.05/GB-month for
+written blocks, ~25–40 GB for this image → **$1.25–2/month per kept generation, ≤$4/month keeping
+two** (current + previous for rollback; prune older). Delete-after-run would save that ~$2–4/month
+by putting a 10–20 min serial bake in front of *every* burst before the first worker takes its
+first job — with one-VM-per-job ephemeral runners (§3), fleet startup latency is the whole game,
+so this is the easiest call in the document. Mechanism — the AMI is a build cache, same
+tags-are-the-schema pattern as everything else:
+
+- **Key** = hash(provisioning script ∥ base image ID ∥ arch ∥ runner agent version), stamped on
+  the AMI as `beep-burst-image-key=<hash>` at bake time.
+- **`burst up`** computes the key, looks the AMI up by tag: hit → launch immediately (the common
+  case, ~90s to registered workers); miss → bake inline, tag, launch, prune generations >2.
+  `burst bake` remains as an explicit subcommand only for forced rebakes.
+- **The agent-version key term is the staleness correctness floor** (research catch): GitHub stops
+  dispatching to runner agents ≳30 days old and we bake `--disableupdate`. The CLI resolves the
+  current runner release at `up` time, so each new agent release (~monthly) changes the key and
+  the next burst self-heals with a fresh bake — staleness is a cache miss, not a warning to act on.
+- **Known decay the key won't notice:** the baked warm `target/` drifts stale against
+  `main`/`Cargo.lock` without changing the key — builds slow gradually until an agent-release
+  rebake. Covered properly by the phase-2 sccache tier; `--rebake` (or an age term in the key) is
+  the cheap interim lever if it bites first.
 
 **Cache warmth, phase 2:** sccache with an S3 backend shared by home runner and fleet keeps builds
 warm *between* bakes and makes AMI staleness degrade gracefully. Deferred — measure fleet build
