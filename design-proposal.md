@@ -1,6 +1,8 @@
 # Burst CI runners — design proposal
 
-**Status: PROPOSAL.** Major axes decided (§6); nothing built. Open questions in §8.
+**Status: DESIGN APPROVED (James, 2026-08-08); nothing built yet.** Every architectural axis is
+decided — see the §6 decision log. §8 holds only tunable defaults; nothing there blocks
+implementation.
 
 ## 1. Requirements
 
@@ -187,7 +189,7 @@ them and GitHub ages them out anyway.
 
 Boot-time dependency install would add 5–10 min to every VM — exactly the latency this tool
 exists to remove — so CI dependencies are baked into an AMI, built by the tool itself (no
-Packer/Ansible): launch a builder from stock Ubuntu/Debian, run the version-controlled
+Packer/Ansible): launch a builder from stock Ubuntu LTS, run the version-controlled
 provisioning script (toolchain, runner agent, browsers, X stack, VM agent + units), optionally
 warm `target/` via `cargo build` against main, `CreateImage`, terminate the builder. The builder
 carries the same tags and kill-schedule as any fleet VM.
@@ -316,12 +318,13 @@ All 2026-08-08, James:
 
 ## 8. Open questions
 
-Defaults awaiting a call (all cheap to change after first contact):
+Starting defaults — **implement as written**; all are cheap to change after first contact, and
+none blocks rollout step 1:
 1. **Timeouts** — never-assigned idle timeout 10 min; hard TTL 6 h.
 2. **Instance type** — lean c7i.2xlarge-class; benchmarks may want bare-metal-ish consistency —
    measure first. Related: root gp3 volume size/IOPS for browser workloads.
 3. **sccache tier** — now or after measuring (lean: after, but §3 raises its value).
-4. **Arch.** x86_64 assumed (parity with the home runner matters for benchmark comparability);
+4. **Arch.** x86_64 (parity with the home runner matters for benchmark comparability);
    Graviton is cheaper if a workload is ever arch-agnostic. The image key already includes arch.
 5. **Region.** Default from the AWS profile; the AMI is region-bound, so a region change is a
    full cache miss (fine, just worth knowing). Spot capacity varies by region/AZ if `--spot` is
