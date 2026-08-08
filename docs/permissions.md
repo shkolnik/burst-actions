@@ -51,10 +51,18 @@ resources.
       "Resource": [
         "arn:aws:ec2:*:*:image/*",
         "arn:aws:ec2:*:*:network-interface/*",
-        "arn:aws:ec2:*:*:security-group/*",
         "arn:aws:ec2:*:*:subnet/*",
         "arn:aws:ec2:*:*:key-pair/*"
       ]
+    },
+    {
+      "Sid": "LaunchIntoOurSecurityGroupOnly",
+      "Effect": "Allow",
+      "Action": "ec2:RunInstances",
+      "Resource": "arn:aws:ec2:*:*:security-group/*",
+      "Condition": {
+        "StringEquals": { "aws:ResourceTag/burst": "1" }
+      }
     },
     {
       "Sid": "TagOnlyAtCreation",
@@ -63,7 +71,8 @@ resources.
       "Resource": "*",
       "Condition": {
         "StringEquals": {
-          "ec2:CreateAction": ["RunInstances", "CreateImage", "CreateSecurityGroup"]
+          "ec2:CreateAction": ["RunInstances", "CreateImage", "CreateSecurityGroup"],
+          "aws:RequestTag/burst": "1"
         }
       }
     },
@@ -113,10 +122,16 @@ resources.
       "Sid": "CreateZeroInboundSecurityGroup",
       "Effect": "Allow",
       "Action": "ec2:CreateSecurityGroup",
-      "Resource": [
-        "arn:aws:ec2:*:*:security-group/*",
-        "arn:aws:ec2:*:*:vpc/*"
-      ]
+      "Resource": "arn:aws:ec2:*:*:security-group/*",
+      "Condition": {
+        "StringEquals": { "aws:RequestTag/burst": "1" }
+      }
+    },
+    {
+      "Sid": "CreateSecurityGroupInVpc",
+      "Effect": "Allow",
+      "Action": "ec2:CreateSecurityGroup",
+      "Resource": "arn:aws:ec2:*:*:vpc/*"
     },
     {
       "Sid": "OneShotKillSchedules",
@@ -190,6 +205,14 @@ What each statement serves:
 | OptInBudgetAlarm | cleanup layer 5 (opt-in; omit this statement if declining the alarm) |
 
 ### Known limits, stated plainly
+
+- **The create/modify fence is the `burst=1` tag** (`aws:RequestTag` on creation,
+  `aws:ResourceTag` on mutation): every resource this key creates must carry it, and the key can
+  only terminate/delete/retag what carries it. Four launch-time *references* cannot be
+  tag-fenced and stay open: the base AMI (Canonical's, untagged — needed to launch the bake
+  builder), the default subnet, the ENI RunInstances creates implicitly, and the optional
+  `--ssh-key` key-pair. All are launch inputs, not mutation targets. The security group
+  reference *is* fenced — instances can only launch into the burst-tagged SG.
 
 - **`SubstrateRoles` + `PassRole` is the sharp edge.** `iam:CreateRole` + `iam:PutRolePolicy`
   scoped to `burst-*` still lets the holder author a `burst-*` role with *any* inline policy and
