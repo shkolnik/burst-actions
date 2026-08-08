@@ -1,6 +1,6 @@
 use super::{Cloud, Instance, InstanceState, LaunchSpec};
 use crate::error::Error;
-use crate::schema::{RepoId, TAG_REPO};
+use crate::schema::{RepoId, TAG_BURST, TAG_REPO};
 use chrono::{DateTime, Utc};
 use std::collections::BTreeMap;
 
@@ -63,6 +63,7 @@ impl Cloud for FakeCloud {
             .iter()
             .filter(|i| i.state != InstanceState::Terminated)
             .filter(|i| i.tags.iter().any(|(k, v)| k == TAG_REPO && *v == repo))
+            .filter(|i| i.tags.iter().any(|(k, v)| k == TAG_BURST && v == "1"))
             .cloned()
             .collect())
     }
@@ -144,6 +145,23 @@ mod tests {
         let launched = c.launch(&spec("octo/widgets", 1)).unwrap();
         c.arm_kill(&launched[0].id, at).unwrap();
         assert_eq!(c.armed_kills(), &[(launched[0].id.clone(), at)]);
+    }
+
+    #[test]
+    fn list_tagged_excludes_instances_missing_burst_tag() {
+        let mut c = FakeCloud::default();
+        c.plant(Instance {
+            id: "i-untagged".into(),
+            state: InstanceState::Running,
+            tags: vec![(TAG_REPO.into(), "octo/widgets".into())],
+        });
+        let listed = c
+            .list_tagged(&RepoId::parse("octo/widgets").unwrap())
+            .unwrap();
+        assert!(
+            listed.is_empty(),
+            "instance without burst=1 must not be listed: {listed:?}"
+        );
     }
 
     #[test]
