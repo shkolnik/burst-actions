@@ -2,8 +2,6 @@
 pub enum Error {
     #[error("invalid repository {given:?}: expected owner/repo (letters, digits, . _ -)")]
     RepoInvalid { given: String },
-    #[error("burst {cmd}: not implemented yet (see implementation-phases.md)")]
-    NotImplemented { cmd: &'static str },
     #[error("cannot read {path}: {source}", path = .path.display())]
     ConfigRead {
         path: std::path::PathBuf,
