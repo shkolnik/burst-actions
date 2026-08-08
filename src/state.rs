@@ -22,8 +22,18 @@ pub struct StateFile {
     pub instances: Vec<InstanceRecord>,
 }
 
+/// Minimal probe for the version field only, so a version mismatch is detected
+/// (and reported with the version message) before attempting a full-shape
+/// deserialization that would otherwise fail with a confusing "missing field"
+/// error on any future incompatible version.
+#[derive(Debug, Deserialize)]
+struct VersionProbe {
+    version: u32,
+}
+
 pub struct RepoState {
     dir: PathBuf,
+    expected_repo: Option<String>,
 }
 
 pub(crate) fn state_root_from(
@@ -52,11 +62,17 @@ impl RepoState {
             path: dir.clone(),
             source,
         })?;
-        Ok(RepoState { dir })
+        Ok(RepoState {
+            dir,
+            expected_repo: Some(repo.to_string()),
+        })
     }
 
     pub fn open_at(dir: PathBuf) -> Self {
-        RepoState { dir }
+        RepoState {
+            dir,
+            expected_repo: None,
+        }
     }
 
     fn path(&self) -> PathBuf {
@@ -70,20 +86,44 @@ impl RepoState {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(source) => return Err(Error::State { path, source }),
         };
+        let probe: VersionProbe = serde_json::from_str(&text).map_err(|e| Error::StateCorrupt {
+            path: path.clone(),
+            reason: e.to_string(),
+        })?;
+        if probe.version != STATE_VERSION {
+            return Err(Error::StateCorrupt {
+                path,
+                reason: format!("unknown statefile version {}", probe.version),
+            });
+        }
         let state: StateFile = serde_json::from_str(&text).map_err(|e| Error::StateCorrupt {
             path: path.clone(),
             reason: e.to_string(),
         })?;
-        if state.version != STATE_VERSION {
+        if let Some(expected) = &self.expected_repo
+            && &state.repo != expected
+        {
             return Err(Error::StateCorrupt {
                 path,
-                reason: format!("unknown statefile version {}", state.version),
+                reason: format!(
+                    "statefile repo {:?} does not match expected repo {expected:?}",
+                    state.repo
+                ),
             });
         }
         Ok(Some(state))
     }
 
     pub fn write(&self, state: &StateFile) -> Result<(), Error> {
+        if state.version != STATE_VERSION {
+            return Err(Error::StateCorrupt {
+                path: self.path(),
+                reason: format!(
+                    "refusing to write statefile version {} — this build only reads version {}",
+                    state.version, STATE_VERSION
+                ),
+            });
+        }
         let tmp = self.dir.join("state.json.tmp");
         let err = |source| Error::State {
             path: tmp.clone(),
@@ -99,6 +139,19 @@ impl RepoState {
         f.sync_all().map_err(err)?;
         std::fs::rename(&tmp, self.path()).map_err(|source| Error::State {
             path: self.path(),
+            source,
+        })?;
+        // fsync the directory too: on POSIX, fsyncing the renamed file does not
+        // guarantee the rename's directory-entry update is durable — a crash
+        // right after rename() can lose the new name (or leave both names) even
+        // though the file's own data was synced. Only fsyncing the containing
+        // directory makes the rename itself durable.
+        let dir = std::fs::File::open(&self.dir).map_err(|source| Error::State {
+            path: self.dir.clone(),
+            source,
+        })?;
+        dir.sync_all().map_err(|source| Error::State {
+            path: self.dir.clone(),
             source,
         })?;
         Ok(())
@@ -173,8 +226,36 @@ mod tests {
     fn unknown_version_is_corrupt() {
         let d = tempfile::tempdir().unwrap();
         let rs = RepoState::open_at(d.path().to_path_buf());
+        // Written directly, not via write(): write() now itself refuses to
+        // persist a version it can't read back (see write_rejects_wrong_version).
+        std::fs::write(
+            d.path().join("state.json"),
+            br#"{"version":2,"repo":"octo/widgets","instances":[]}"#,
+        )
+        .unwrap();
+        assert!(matches!(rs.read(), Err(Error::StateCorrupt { .. })));
+    }
+
+    #[test]
+    fn write_rejects_wrong_version() {
+        let d = tempfile::tempdir().unwrap();
+        let rs = RepoState::open_at(d.path().to_path_buf());
         let mut s = sample();
         s.version = 2;
+        assert!(matches!(rs.write(&s), Err(Error::StateCorrupt { .. })));
+        // Nothing should have been persisted.
+        assert!(rs.read().unwrap().is_none());
+    }
+
+    #[test]
+    fn read_rejects_repo_mismatch() {
+        let d = tempfile::tempdir().unwrap();
+        let rs = RepoState {
+            dir: d.path().to_path_buf(),
+            expected_repo: Some("octo/widgets".into()),
+        };
+        let mut s = sample();
+        s.repo = "someone/else".into();
         rs.write(&s).unwrap();
         assert!(matches!(rs.read(), Err(Error::StateCorrupt { .. })));
     }
@@ -182,8 +263,6 @@ mod tests {
     #[test]
     fn open_respects_xdg_state_home() {
         let d = tempfile::tempdir().unwrap();
-        // env mutation: safe here because cargo runs tests in-process threads —
-        // serialize by using a unique var read at call time via helper.
         let root = state_root_from(Some(d.path().as_os_str().into()), None).unwrap();
         assert_eq!(root, d.path().join("burst"));
         let home = state_root_from(None, Some("/home/u".into())).unwrap();
