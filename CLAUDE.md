@@ -65,10 +65,51 @@ evidence and options, never a thing to silently redesign around. §8's defaults 
   it and saw X" and "the docs say X" are different sentences — write them differently.
 - **Critical engagement over agreement.** He wants pushback, surfaced tensions, and options with
   a stated lean on open calls — not validation. Security thinking in blast-radius/least-privilege
-  terms lands well; name the tradeoff.
+  terms lands well; name the tradeoff. When he offers "a suggestion," that is a request to
+  *evaluate* it — including telling him it's wrong — not an instruction phrased politely.
+- **Naming is behaviour design.** A flag, tag, subcommand, or error name shapes what users do
+  with it; treat renames and new names as design decisions, not cosmetics.
+- **Frugal words.** In docs, CLI output, and reports, words that don't add meaning are wasted
+  cost (agents pay per token to read them). Lead with the answer; organize for progressive
+  disclosure — summary first, detail where the reader who needs it will look.
 - **Commit as you go**, one verified change per commit, honest messages (a failing test is
   reported failing). Delegate mechanical execution to subagents freely, but verify every
   load-bearing claim yourself before reporting it.
+- **Debug root-cause-first.** No fix attempts before you can state the root cause and reproduce
+  it; one hypothesis, smallest possible test, one change at a time. Three failed fixes means the
+  design is wrong — stop and bring it to James rather than trying a fourth.
+
+## Engineering philosophy (generalized from James's other projects — apply here)
+
+- **Make the compiler the reviewer.** An agent-built codebase is read a few files at a time; the
+  compiler reads all of them at once. A closed set of alternatives (instance lifecycle states,
+  cleanup outcomes, error kinds) is a Rust `enum` matched exhaustively — never a bare `String`
+  compared with `==`. Adding a variant must *break the build* at every site that has to change,
+  not leave stale branches silently taking the `else`.
+- **Reversibility sets the burden of proof.** An internal enum is an afternoon to reverse;
+  anything users script against once released — CLI flag names, tag schema, statefile format,
+  exit codes — is close to forever. Under uncertainty, take the reversible option and revisit
+  when real demand appears. Prerelease corollary: with no users yet, prefer the cleaner schema
+  over compatibility with an on-disk format nobody depends on.
+- **A finding is a sample, not the defect — fix the class.** A bug names one site because that's
+  where attention landed. A fix is done when you can answer "what invariant did I restore, and
+  where else must it hold?" — and the strongest fix makes the bad state unrepresentable rather
+  than enumerating its instances. What you find but don't fix, you record.
+- **One spelling per message.** Output is read by humans, scripts, *and* agents in CI logs; two
+  spellings of one condition silently degrade the agent reader with no error anywhere. Structure
+  the producer (one authoring site per message/error) and keep messages stable once shipped.
+- **Wanting a long comment is evidence about the code.** Simplify first — a better name, a
+  smaller function, a type. A comment earns its place caching a slow-changing *external* fact at
+  the point of need (an AWS API quirk, IAM propagation behavior — exactly §5's wrinkles); it
+  never narrates history or demonstrates that you did the research. Evidence of verification
+  goes in the commit message or a test that fails when the fact stops being true.
+- **Prove ownership before destroy.** Never terminate or delete by name-pattern or broad
+  listing; every destructive operation re-verifies the `burst-*` tag identity of the specific
+  resource immediately before acting. The failure mode — killing something in the account that
+  isn't ours — is irreversible, so this holds even in throwaway debugging scripts.
+- **The environment is an undeclared dependency.** Probe for what you need (AWS credentials,
+  region, default VPC, quota) and either work fully or refuse with the reason — never degrade
+  into partial behavior because something was absent.
 
 ## Implementation guardrails from the design
 
