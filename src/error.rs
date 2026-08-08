@@ -30,4 +30,6 @@ pub enum Error {
     },
     #[error("{reason}")]
     Environment { reason: String },
+    #[error("another burst invocation is already running for this repo (lock held in {repo_dir}); a crashed run would have released it — wait for or stop the other invocation", repo_dir = .repo_dir.display())]
+    LockHeld { repo_dir: std::path::PathBuf },
 }

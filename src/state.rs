@@ -36,6 +36,10 @@ pub struct RepoState {
     expected_repo: Option<String>,
 }
 
+pub struct RepoLock {
+    _file: std::fs::File,
+}
+
 pub(crate) fn state_root_from(
     xdg: Option<OsString>,
     home: Option<OsString>,
@@ -157,6 +161,21 @@ impl RepoState {
         Ok(())
     }
 
+    pub fn lock(&self) -> Result<RepoLock, Error> {
+        let path = self.dir.join("lock");
+        let file = std::fs::File::create(&path).map_err(|source| Error::State {
+            path: path.clone(),
+            source,
+        })?;
+        match file.try_lock() {
+            Ok(()) => Ok(RepoLock { _file: file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(Error::LockHeld {
+                repo_dir: self.dir.clone(),
+            }),
+            Err(std::fs::TryLockError::Error(source)) => Err(Error::State { path, source }),
+        }
+    }
+
     pub fn delete(&self) -> Result<(), Error> {
         match std::fs::remove_file(self.path()) {
             Ok(()) => Ok(()),
@@ -268,5 +287,33 @@ mod tests {
         let home = state_root_from(None, Some("/home/u".into())).unwrap();
         assert_eq!(home, std::path::Path::new("/home/u/.local/state/burst"));
         assert!(state_root_from(None, None).is_err());
+    }
+
+    #[test]
+    fn second_lock_fails_fast_while_first_held() {
+        let d = tempfile::tempdir().unwrap();
+        let rs = RepoState::open_at(d.path().to_path_buf());
+        let _held = rs.lock().unwrap();
+        // flock is per open-file-description, so a second open in this process conflicts.
+        let rs2 = RepoState::open_at(d.path().to_path_buf());
+        assert!(matches!(rs2.lock(), Err(Error::LockHeld { .. })));
+    }
+
+    #[test]
+    fn lock_releases_on_drop() {
+        let d = tempfile::tempdir().unwrap();
+        let rs = RepoState::open_at(d.path().to_path_buf());
+        drop(rs.lock().unwrap());
+        assert!(rs.lock().is_ok(), "dropped lock must be re-acquirable");
+    }
+
+    #[test]
+    fn abandoned_run_signal_is_statefile_present_plus_lock_acquirable() {
+        let d = tempfile::tempdir().unwrap();
+        let rs = RepoState::open_at(d.path().to_path_buf());
+        rs.write(&sample()).unwrap();
+        // No live holder: the lock acquires AND state is present → residue to adopt.
+        let _lock = rs.lock().unwrap();
+        assert!(rs.read().unwrap().is_some());
     }
 }
