@@ -47,6 +47,8 @@ small owned implementation safe to own.
 
 One standalone Rust binary, `burst` (on `aws-sdk-rust`), plus ~120 lines of bash + three systemd
 units baked into an AMI. Subcommands: `up [N|--auto] [--spot]`, `bake`, `status`, `down`, `sweep`.
+**One invocation serves one GitHub repo**; the repo and its project-specific CI provisioning
+config are required inputs (the tool is project-agnostic — many repos use it, one at a time).
 
 **At idle there exists:** one AMI + its EBS snapshot, two IAM roles (instance profile; EventBridge
 Scheduler execution role), one security group, an opt-in budget alarm, and — phase 2 — one S3
@@ -62,10 +64,11 @@ TOML block for instance type, timeouts, max fleet, region — all with working d
 ### Invariants
 
 1. **Scale to zero.** No daemon, webhook receiver, Lambda, or warm pool. Ever.
-2. **Tag or it doesn't exist.** Every instance carries `beep-burst=1` and
-   `beep-burst-expires=<ISO8601>`, applied atomically inside `RunInstances`. Anything tagged and
-   past expiry is terminable by anyone without inspection. The cloud is the state; tags are the
-   schema; no state file exists to disagree with reality (also why no Terraform).
+2. **Tag or it doesn't exist.** Every instance carries `beep-burst=1`,
+   `beep-burst-repo=<owner/repo>`, and `beep-burst-expires=<ISO8601>`, applied atomically inside
+   `RunInstances`. Anything tagged and past expiry is terminable by anyone without inspection.
+   The cloud is the state; tags are the schema; the local statefile (below) is a manifest for UX
+   and adoption, never a source of truth that can disagree with reality (also why no Terraform).
 3. **Termination needs no cooperation.** No cleanup path requires the VM's OS, the GitHub API, or
    the launching CLI to be alive.
 4. **A VM never holds a credential that outlives it or exceeds it.** Its only GitHub material is
@@ -93,6 +96,7 @@ only covers runners that never connected), and every job gets a fresh filesystem
 
 ```
 burst up N:
+  take repo lock; read/adopt statefile   # concurrency — see below
   ensure_substrate()              # get-or-create roles / SG / alarm (idempotent)
   sweep()                         # reap anything expired — rent paid on entry
   check fork-approval setting     # invariant 5
@@ -103,8 +107,32 @@ burst up N:
                                   #   JIT config in user-data, IMDSv2 required
   arm N EventBridge Scheduler one-shots: TerminateInstances(id) at launch+TTL,
                                   #   ActionAfterCompletion=DELETE
-  exit                            # the CLI is not a supervisor; killing it leaks nothing
+  record instances in statefile
+  watch                           # poll until every watched instance is gone, reporting
+                                  #   progress; then final tidy (never-connected
+                                  #   registrations, orphan schedules), delete statefile
 ```
+
+**The watcher is an observer, never a required participant** (invariant 3 is untouched): cleanup
+layers 1–3 run without it, so SIGKILLing the watcher at any instruction leaks nothing — the fleet
+finishes and self-terminates, and the leftover statefile is the adoptable-residue signal for the
+next invocation. **Ctrl-C detaches, it does not tear down** — jobs are the valuable thing; the
+watcher exits with "fleet still running — re-run to re-attach, `burst down` to kill." Teardown is
+only ever the explicit `burst down`.
+
+**Concurrency and resumption (per-repo lock + statefile, James 2026-08-08):** two files under
+`~/.local/state/burst/<owner>-<repo>/` — a lockfile held under an OS advisory lock (`flock`) for
+the process lifetime, and a JSON statefile listing spawned instance IDs, updated by
+write-then-rename so a concurrent reader never sees a torn state. A second invocation while the
+lock is held **fails fast**. A crashed/killed process's flock evaporates with it, so "statefile
+present + lock acquirable" *is* the abandoned-run signal — no PID heuristics. The next invocation
+then adopts: take the lock, reconcile the statefile against the cloud (file entries no longer
+alive → drop; instances tagged `beep-burst-repo=<repo>` but absent from the file → adopt anyway —
+tags stay authoritative), resume watching, then execute its own command if compatible (`up N`
+composes: watch the adopted fleet AND launch N more). If incompatible, warn and keep the resumed
+watch. Known hole, accepted: the lock is per-machine; two *machines* bursting one repo aren't
+serialized, and the cloud side is already safe under that race (over-provisioned VMs die on the
+idle timeout; worst case is a wasteful double-bake).
 
 On the VM, cloud-init arms watchdogs BEFORE starting the runner: a TTL-hour absolute-lifetime
 poweroff and a 10-minute registered-or-poweroff bootstrap deadline. Then the runner runs its one
@@ -186,6 +214,8 @@ With one job per VM, N is the number of queued jobs: `burst up --auto` counts qu
 burst-labeled jobs (capped at `max_fleet`, default 12) — the primary UX; `burst up N` covers
 launching ahead of a push. No mid-flight rescaling: grow by running `up` again; shrink is
 automatic. Under-provisioning is benign — leftover jobs fall to the home runner or a second `up`.
+`burst up` checks the account's on-demand (or spot) vCPU quota and warns when it caps the fleet
+below the request, rather than half-launching silently.
 
 **On-demand by default, `--spot` opt-in:** loop latency is the stated priority, and a spot
 reclaim mid-benchmark taxes the loop to save single-digit dollars a month. `--spot` fits long
@@ -202,8 +232,9 @@ only; runner groups are org-scoped and add nothing here.
 
 ### Security
 
-- **PAT** on the dev machine only, never on a VM. On a VM: one single-use JIT config (in
-  user-data; IMDSv2 enforced) and the near-empty instance profile.
+- **PAT** on the dev machine only, never on a VM. No rotation machinery: an expired or invalid
+  token fails loud with a clear "rotate it" message, nothing more. On a VM: one single-use JIT
+  config (in user-data; IMDSv2 enforced) and the near-empty instance profile.
 - **Network:** zero-inbound security group (the runner long-polls outbound); no SSH keys by
   default (`--ssh-key` for debug sessions). Egress open: allow-listing was rejected — GitHub's
   CIDRs churn, benchmarks need the real web, and the fork-approval gate (invariant 5) carries the
@@ -239,6 +270,14 @@ All 2026-08-08, James:
 3. **AMI kept between runs**, content-addressed by config hash; **one generation**.
 4. **Rust** (`aws-sdk-rust`), standalone crate.
 5. Zero AWS pre-setup; no Terraform/Ansible (litmus tests from the original request).
+6. **One repo per invocation**; repo + project CI config are required inputs. Many repos use the
+   tool, one at a time.
+7. **Happy-path invocation is a long-running watcher** with a per-repo `flock` lockfile +
+   manifest statefile; concurrent invocation fails fast; an abandoned run (statefile present,
+   lock acquirable) is adopted and resumed by the next invocation. Watcher remains an observer —
+   killing it leaks nothing; Ctrl-C detaches, only `burst down` tears down.
+8. **PAT expiry/invalidity fails loud** with a clear message; no rotation machinery.
+9. **vCPU-quota check**: warn when the account quota caps the fleet below the request.
 
 ## 7. Rollout
 
@@ -258,25 +297,8 @@ Defaults awaiting a call (all cheap to change after first contact):
 2. **Instance type** — lean c7i.2xlarge-class; benchmarks may want bare-metal-ish consistency —
    measure first. Related: root gp3 volume size/IOPS for browser workloads.
 3. **sccache tier** — now or after measuring (lean: after, but §3 raises its value).
-
-Latent — likely to surface at execution time, no design change expected but each needs an answer:
-4. **Multi-repo scope.** The repos live under a personal account, and org-level runners don't
-   exist for user accounts — so registration is per-repo. If burst serves both the main repo and
-   the benchmarks repo, the config needs a repo list, `--auto` must count queues across them, and
-   each VM's JIT config pins it to one repo. Fleet-splitting heuristic when both have queued work?
-5. **Arch.** x86_64 assumed (parity with the home runner matters for benchmark comparability);
+4. **Arch.** x86_64 assumed (parity with the home runner matters for benchmark comparability);
    Graviton is cheaper if a workload is ever arch-agnostic. The image key already includes arch.
-6. **EC2 vCPU quota.** A fresh account's on-demand vCPU quota can cap the fleet below
-   `max_fleet`. `burst up` should detect the quota and say so rather than half-launching silently.
-7. **Concurrent invocations.** Two `burst up`s racing is mostly benign (sweep is idempotent;
-   over-provisioned VMs die on the idle timeout) but a simultaneous image-cache miss double-bakes
-   — wasteful, not harmful. Accept or add a cheap bake lock (e.g. conditional tag write)?
-8. **PAT lifetime.** Fine-grained PATs expire (max 1 year); the tool should fail with a clear
-   "token expired, rotate it" rather than an opaque 401. A GitHub App would auto-rotate but adds
-   setup — against the zero-pre-setup litmus. Accept annual manual rotation?
-9. **Region.** Default from the AWS profile; the AMI is region-bound, so a region change is a
+5. **Region.** Default from the AWS profile; the AMI is region-bound, so a region change is a
    full cache miss (fine, just worth knowing). Spot capacity varies by region/AZ if `--spot` is
    used.
-10. **Provisioning config location.** The tool is project-agnostic; each project supplies its
-    provisioning script + `[burst]` block. Where does discovery happen — a path flag, a
-    well-known file in the invoking repo, or both?
