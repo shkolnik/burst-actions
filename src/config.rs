@@ -22,6 +22,7 @@ struct BurstTable {
     arch: Option<String>,
     base_ami: Option<String>,
     provision: Option<PathBuf>,
+    budget_alarm_usd: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -35,6 +36,9 @@ pub struct Config {
     pub arch: Arch,
     pub base_ami: Option<String>,
     pub provision: Option<PathBuf>,
+    /// Monthly AWS Budgets cost alarm in USD (design §3 layer 5). Absent
+    /// means no alarm is created — this is opt-in. Suggested value: $15.
+    pub budget_alarm_usd: Option<u32>,
 }
 
 pub fn load(dir: &Path, repo_flag: Option<&str>) -> Result<Config, Error> {
@@ -74,6 +78,10 @@ pub fn load(dir: &Path, repo_flag: Option<&str>) -> Result<Config, Error> {
         Some(n) => Ok(n),
         None => Ok(default),
     };
+    let budget_alarm_usd = match table.budget_alarm_usd {
+        Some(0) => return Err(invalid("budget_alarm_usd must be at least 1".into())),
+        other => other,
+    };
 
     Ok(Config {
         repo,
@@ -85,6 +93,7 @@ pub fn load(dir: &Path, repo_flag: Option<&str>) -> Result<Config, Error> {
         arch,
         base_ami: table.base_ami,
         provision: table.provision,
+        budget_alarm_usd,
     })
 }
 
@@ -110,6 +119,21 @@ mod tests {
         assert_eq!(c.ttl_hours, 6);
         assert_eq!(c.arch, Arch::X86_64);
         assert!(c.region.is_none() && c.base_ami.is_none() && c.provision.is_none());
+        assert!(c.budget_alarm_usd.is_none());
+    }
+
+    #[test]
+    fn budget_alarm_usd_loads_when_set() {
+        let d = dir_with("[burst]\nrepo = \"a/b\"\nbudget_alarm_usd = 15\n");
+        let c = load(d.path(), None).unwrap();
+        assert_eq!(c.budget_alarm_usd, Some(15));
+    }
+
+    #[test]
+    fn budget_alarm_usd_zero_rejected() {
+        let d = dir_with("[burst]\nrepo = \"a/b\"\nbudget_alarm_usd = 0\n");
+        let e = load(d.path(), None).unwrap_err().to_string();
+        assert!(e.contains("budget_alarm_usd"), "{e}");
     }
 
     #[test]

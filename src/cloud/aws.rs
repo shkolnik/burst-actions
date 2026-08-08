@@ -48,10 +48,57 @@ pub struct AwsContext {
     ec2: aws_sdk_ec2::Client,
     #[allow(dead_code)] // wired up by later tasks (arm_kill)
     scheduler: aws_sdk_scheduler::Client,
-    #[allow(dead_code)] // wired up by later tasks (bake role setup)
     iam: aws_sdk_iam::Client,
-    #[allow(dead_code)] // wired up by later tasks (quota/budget checks)
     budgets: aws_sdk_budgets::Client,
+    sts: aws_sdk_sts::Client,
+}
+
+/// The substrate `ensure_substrate` produces: the roles, security group, and
+/// subnet a launch needs. Every field is get-or-created, never assumed.
+#[derive(Debug, Clone)]
+pub struct Substrate {
+    pub instance_profile_name: String,
+    pub scheduler_role_arn: String,
+    pub security_group_id: String,
+    pub subnet_id: String,
+}
+
+const INSTANCE_ROLE_NAME: &str = "burst-actions-instance";
+const SCHEDULER_ROLE_NAME: &str = "burst-actions-scheduler";
+const SCHEDULER_POLICY_NAME: &str = "burst-actions-terminate";
+const SECURITY_GROUP_NAME: &str = "burst-actions";
+const BUDGET_NAME: &str = "burst-actions-monthly";
+
+/// IAM trust ("assume role") policy for `service` — the only principal
+/// allowed to assume the role.
+fn trust_policy(service: &str) -> String {
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Principal": { "Service": service },
+            "Action": "sts:AssumeRole"
+        }]
+    })
+    .to_string()
+}
+
+/// Inline policy for `burst-actions-scheduler`: it may terminate EC2
+/// instances, but only ones tagged `burst-actions=1` — the tag-fenced kill
+/// invariant 4 relies on.
+fn scheduler_kill_policy() -> String {
+    serde_json::json!({
+        "Version": "2012-10-17",
+        "Statement": [{
+            "Effect": "Allow",
+            "Action": "ec2:TerminateInstances",
+            "Resource": "arn:aws:ec2:*:*:instance/*",
+            "Condition": {
+                "StringEquals": { "aws:ResourceTag/burst-actions": "1" }
+            }
+        }]
+    })
+    .to_string()
 }
 
 /// Resolve the region to use: config (`burst.toml`) wins over the resolved
@@ -99,6 +146,7 @@ impl AwsContext {
         let scheduler = aws_sdk_scheduler::Client::new(&sdk_config);
         let iam = aws_sdk_iam::Client::new(&sdk_config);
         let budgets = aws_sdk_budgets::Client::new(&sdk_config);
+        let sts = aws_sdk_sts::Client::new(&sdk_config);
 
         Ok(AwsContext {
             runtime,
@@ -106,6 +154,7 @@ impl AwsContext {
             scheduler,
             iam,
             budgets,
+            sts,
         })
     }
 
@@ -181,6 +230,326 @@ impl AwsContext {
 
             Ok((vpc_id, subnet_id))
         })
+    }
+
+    /// Idempotent get-or-create of every substrate resource: the instance
+    /// role/profile, the tag-fenced scheduler role, the zero-inbound
+    /// security group, and (opt-in) a monthly budget alarm. Safe to call on
+    /// a fresh account or the thousandth run — same code path either way.
+    pub fn ensure_substrate(&self, budget_alarm_usd: Option<u32>) -> Result<Substrate, Error> {
+        let (_vpc_id, subnet_id) = self.default_vpc_and_subnet()?;
+
+        self.runtime.block_on(async {
+            let instance_profile_name = self.ensure_instance_role_and_profile().await?;
+            let scheduler_role_arn = self.ensure_scheduler_role().await?;
+            let security_group_id = self.ensure_security_group(&_vpc_id).await?;
+
+            if let Some(limit_usd) = budget_alarm_usd {
+                self.ensure_budget(limit_usd).await?;
+            }
+
+            Ok(Substrate {
+                instance_profile_name,
+                scheduler_role_arn,
+                security_group_id,
+                subnet_id,
+            })
+        })
+    }
+
+    /// Role `burst-actions-instance` (trust ec2.amazonaws.com, no policies —
+    /// invariant 4's near-empty profile) + matching instance profile, with
+    /// the role attached. Returns the instance profile name.
+    async fn ensure_instance_role_and_profile(&self) -> Result<String, Error> {
+        match self
+            .iam
+            .get_role()
+            .role_name(INSTANCE_ROLE_NAME)
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_no_such_entity_exception()) =>
+            {
+                self.iam
+                    .create_role()
+                    .role_name(INSTANCE_ROLE_NAME)
+                    .assume_role_policy_document(trust_policy("ec2.amazonaws.com"))
+                    .send()
+                    .await
+                    .map_err(|e| Error::Aws {
+                        op: "CreateRole(burst-actions-instance)",
+                        message: format_aws_error(&e),
+                    })?;
+            }
+            Err(e) => {
+                return Err(Error::Aws {
+                    op: "GetRole(burst-actions-instance)",
+                    message: format_aws_error(&e),
+                });
+            }
+        }
+
+        match self
+            .iam
+            .get_instance_profile()
+            .instance_profile_name(INSTANCE_ROLE_NAME)
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_no_such_entity_exception()) =>
+            {
+                self.iam
+                    .create_instance_profile()
+                    .instance_profile_name(INSTANCE_ROLE_NAME)
+                    .send()
+                    .await
+                    .map_err(|e| Error::Aws {
+                        op: "CreateInstanceProfile(burst-actions-instance)",
+                        message: format_aws_error(&e),
+                    })?;
+            }
+            Err(e) => {
+                return Err(Error::Aws {
+                    op: "GetInstanceProfile(burst-actions-instance)",
+                    message: format_aws_error(&e),
+                });
+            }
+        }
+
+        match self
+            .iam
+            .add_role_to_instance_profile()
+            .instance_profile_name(INSTANCE_ROLE_NAME)
+            .role_name(INSTANCE_ROLE_NAME)
+            .send()
+            .await
+        {
+            Ok(_) => {}
+            // LimitExceeded: an instance profile holds at most one role, and
+            // ours is already attached — already-done, not a failure.
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_limit_exceeded_exception()) => {}
+            Err(e) => {
+                return Err(Error::Aws {
+                    op: "AddRoleToInstanceProfile(burst-actions-instance)",
+                    message: format_aws_error(&e),
+                });
+            }
+        }
+
+        Ok(INSTANCE_ROLE_NAME.to_string())
+    }
+
+    /// Role `burst-actions-scheduler` (trust scheduler.amazonaws.com) with
+    /// the inline `burst-actions-terminate` policy scoping it to killing
+    /// only tagged instances. Returns the role ARN.
+    async fn ensure_scheduler_role(&self) -> Result<String, Error> {
+        let arn = match self
+            .iam
+            .get_role()
+            .role_name(SCHEDULER_ROLE_NAME)
+            .send()
+            .await
+        {
+            Ok(out) => out
+                .role()
+                .map(|r| r.arn().to_string())
+                .ok_or_else(|| Error::Aws {
+                    op: "GetRole(burst-actions-scheduler)",
+                    message: "response had no role".to_string(),
+                })?,
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_no_such_entity_exception()) =>
+            {
+                let out = self
+                    .iam
+                    .create_role()
+                    .role_name(SCHEDULER_ROLE_NAME)
+                    .assume_role_policy_document(trust_policy("scheduler.amazonaws.com"))
+                    .send()
+                    .await
+                    .map_err(|e| Error::Aws {
+                        op: "CreateRole(burst-actions-scheduler)",
+                        message: format_aws_error(&e),
+                    })?;
+                out.role()
+                    .map(|r| r.arn().to_string())
+                    .ok_or_else(|| Error::Aws {
+                        op: "CreateRole(burst-actions-scheduler)",
+                        message: "response had no role".to_string(),
+                    })?
+            }
+            Err(e) => {
+                return Err(Error::Aws {
+                    op: "GetRole(burst-actions-scheduler)",
+                    message: format_aws_error(&e),
+                });
+            }
+        };
+
+        // PutRolePolicy overwrites unconditionally on the given name, so
+        // this is idempotent by construction — no need to check existence.
+        self.iam
+            .put_role_policy()
+            .role_name(SCHEDULER_ROLE_NAME)
+            .policy_name(SCHEDULER_POLICY_NAME)
+            .policy_document(scheduler_kill_policy())
+            .send()
+            .await
+            .map_err(|e| Error::Aws {
+                op: "PutRolePolicy(burst-actions-terminate)",
+                message: format_aws_error(&e),
+            })?;
+
+        Ok(arn)
+    }
+
+    /// Security group `burst-actions` in `vpc_id`: get-or-create, zero
+    /// ingress rules ever added (a fresh SG starts zero-inbound; we hold no
+    /// rule-editing permission, so the absence is IAM-enforced, not just
+    /// convention).
+    async fn ensure_security_group(&self, vpc_id: &str) -> Result<String, Error> {
+        let existing = self
+            .ec2
+            .describe_security_groups()
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("group-name")
+                    .values(SECURITY_GROUP_NAME)
+                    .build(),
+            )
+            .filters(
+                aws_sdk_ec2::types::Filter::builder()
+                    .name("vpc-id")
+                    .values(vpc_id)
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| Error::Aws {
+                op: "DescribeSecurityGroups",
+                message: format_aws_error(&e),
+            })?;
+
+        if let Some(id) = existing
+            .security_groups()
+            .first()
+            .and_then(|g| g.group_id())
+        {
+            return Ok(id.to_string());
+        }
+
+        let created = self
+            .ec2
+            .create_security_group()
+            .group_name(SECURITY_GROUP_NAME)
+            .description("burst-actions fleet instances (zero inbound)")
+            .vpc_id(vpc_id)
+            .tag_specifications(
+                aws_sdk_ec2::types::TagSpecification::builder()
+                    .resource_type(aws_sdk_ec2::types::ResourceType::SecurityGroup)
+                    .tags(
+                        aws_sdk_ec2::types::Tag::builder()
+                            .key("burst-actions")
+                            .value("1")
+                            .build(),
+                    )
+                    .build(),
+            )
+            .send()
+            .await
+            .map_err(|e| Error::Aws {
+                op: "CreateSecurityGroup(burst-actions)",
+                message: format_aws_error(&e),
+            })?;
+
+        created
+            .group_id()
+            .map(str::to_string)
+            .ok_or_else(|| Error::Aws {
+                op: "CreateSecurityGroup(burst-actions)",
+                message: "response had no group id".to_string(),
+            })
+    }
+
+    /// Opt-in monthly cost budget `burst-actions-monthly` with limit
+    /// `limit_usd`. Get-or-create on the `budgets` global (us-east-1)
+    /// endpoint. Only called when the caller opted in.
+    async fn ensure_budget(&self, limit_usd: u32) -> Result<(), Error> {
+        let account_id = self
+            .sts
+            .get_caller_identity()
+            .send()
+            .await
+            .map_err(|e| Error::Aws {
+                op: "GetCallerIdentity",
+                message: format_aws_error(&e),
+            })?
+            .account()
+            .ok_or_else(|| Error::Aws {
+                op: "GetCallerIdentity",
+                message: "response had no account id".to_string(),
+            })?
+            .to_string();
+
+        match self
+            .budgets
+            .describe_budget()
+            .account_id(&account_id)
+            .budget_name(BUDGET_NAME)
+            .send()
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.as_service_error()
+                    .is_some_and(|s| s.is_not_found_exception()) =>
+            {
+                let budget = aws_sdk_budgets::types::Budget::builder()
+                    .budget_name(BUDGET_NAME)
+                    .budget_limit(
+                        aws_sdk_budgets::types::Spend::builder()
+                            .amount(limit_usd.to_string())
+                            .unit("USD")
+                            .build()
+                            .map_err(|e| Error::Aws {
+                                op: "CreateBudget(burst-actions-monthly)",
+                                message: format_aws_error(&e),
+                            })?,
+                    )
+                    .time_unit(aws_sdk_budgets::types::TimeUnit::Monthly)
+                    .budget_type(aws_sdk_budgets::types::BudgetType::Cost)
+                    .build()
+                    .map_err(|e| Error::Aws {
+                        op: "CreateBudget(burst-actions-monthly)",
+                        message: format_aws_error(&e),
+                    })?;
+
+                self.budgets
+                    .create_budget()
+                    .account_id(&account_id)
+                    .budget(budget)
+                    .send()
+                    .await
+                    .map_err(|e| Error::Aws {
+                        op: "CreateBudget(burst-actions-monthly)",
+                        message: format_aws_error(&e),
+                    })?;
+                Ok(())
+            }
+            Err(e) => Err(Error::Aws {
+                op: "DescribeBudget(burst-actions-monthly)",
+                message: format_aws_error(&e),
+            }),
+        }
     }
 }
 
@@ -278,6 +647,52 @@ mod tests {
         assert!(formatted.contains("dispatch failure"));
         assert!(formatted.contains("no credentials in the property bag"));
         assert!(formatted.contains("configure AWS credentials: env vars or `aws configure`"));
+    }
+
+    #[test]
+    fn trust_policy_names_exact_service_principal() {
+        let doc: serde_json::Value =
+            serde_json::from_str(&trust_policy("ec2.amazonaws.com")).unwrap();
+        assert_eq!(
+            doc,
+            serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Principal": { "Service": "ec2.amazonaws.com" },
+                    "Action": "sts:AssumeRole"
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn trust_policy_varies_by_service() {
+        let doc: serde_json::Value =
+            serde_json::from_str(&trust_policy("scheduler.amazonaws.com")).unwrap();
+        assert_eq!(
+            doc["Statement"][0]["Principal"]["Service"],
+            "scheduler.amazonaws.com"
+        );
+    }
+
+    #[test]
+    fn scheduler_kill_policy_is_tag_fenced_terminate_only() {
+        let doc: serde_json::Value = serde_json::from_str(&scheduler_kill_policy()).unwrap();
+        assert_eq!(
+            doc,
+            serde_json::json!({
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "ec2:TerminateInstances",
+                    "Resource": "arn:aws:ec2:*:*:instance/*",
+                    "Condition": {
+                        "StringEquals": { "aws:ResourceTag/burst-actions": "1" }
+                    }
+                }]
+            })
+        );
     }
 
     #[test]
