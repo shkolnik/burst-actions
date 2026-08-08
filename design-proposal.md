@@ -18,6 +18,9 @@ Hard requirements:
   still work in two years untouched.
 - **Zero AWS account pre-setup** — works given only AWS + GitHub credentials; everything else the
   tool creates itself. Configuration beyond credentials is optional.
+- **Genuinely open source** — find it or write it. A tool whose server/agent is a closed or
+  source-available binary does not qualify, however good; OSI-licensed source for everything that
+  runs.
 - **No Terraform/Ansible dependency** (available in the homelab, disfavored).
 - AWS first; cross-cloud a bonus. Prefer a mature existing tool over invention — but a small owned
   tool beats an enterprise system.
@@ -37,7 +40,9 @@ small owned implementation of it safe. Every existing *package* of it fails a ha
 | **terraform-aws-github-runner** (ex-philips-labs) | Lambda+SQS webhook autoscaler | Standing multi-Lambda control plane, Terraform-based, built for sustained team volume; repo archived/migrated orgs in 2025. |
 | **GARM** (cloudbase) | Multi-cloud pool daemon | An always-on service to babysit, automating a demand signal the human already has. |
 | **machulav/ec2-github-runner**, **ubergeek77/aws-ec2-spot-runner** | Workflow steps that start/stop EC2 | Zero standing infra (right spirit), but runner lifetime is tied to one workflow run and cleanup rides on a `stop` job a cancelled run can skip. Kept as reference implementations. |
-| **RunsOn** (runs-on.com) | CloudFormation stack in your own account; per-job ephemeral VMs; free for non-commercial | The credible buy option: no k8s, scale-to-zero, actively maintained, no vendor-hosted control plane. Rejected only because it's third-party code holding EC2 rights in our account and the small owned alternative exists. **Fallback: if the DIY tool palls, adopt RunsOn rather than growing it.** |
+| **RunsOn** (runs-on.com) | CloudFormation stack in your own account; per-job ephemeral VMs; free for non-commercial | The credible buy option: no k8s, actively maintained, no vendor-hosted control plane. **Rejected on the open-source requirement**: only its CloudFormation assets are MIT — the server and agent are closed commercial binaries (source access is a €3,600/yr tier). Secondary: standing webhook stack (API GW + Lambda + Fargate task), and its cleanup paths depend on that closed server being alive — unauditable, where our layer 1 is provable. An adversarial review (2026-08-08) confirmed these are the load-bearing objections; on cost, maturity, and setup it would otherwise win. **Fallback if licensing posture ever changes.** |
+| **CloudSnorkel/cdk-github-runners** | CDK app: GitHub webhook → Lambda → Step Functions → ephemeral EC2 per job | The closest genuinely-OSS system (Apache-2.0, active, EC2-native, no k8s, serverless control plane with zero idle compute). Rejected: it is an always-armed webhook autoscaler, not an on-demand burst command; pulls in CDK/CloudFormation; and documents no VM-independent kill switch for a hung runner (README: failed *starts* retry 24 h — nothing shown for crashed/hung instances). **Best reference reading for our edge cases** — its history is actively fighting the same races (e.g. launch-time tagging because instances can die before the agent installs). |
+| **fireactions** (Hostinger), **testflows-github-hetzner-runners**, **ForgeMT** (Cisco) | Firecracker pool daemon; Hetzner one-VM-per-job service; multi-tenant EC2 control plane | All genuinely OSS, all fail hard requirements (no EC2 support / wrong cloud / standing control plane for platform teams). Kept as design reading: microVM lifecycle, single-process operational simplicity, tenant-scoped IAM respectively. |
 | Hosted vendors (WarpBuild, Namespace, …) | Rent their fleet | Vendor-existential risk (BuildJet and Cirrus CI both died H1 2026); spot EC2 is ~2.7× cheaper than GitHub's hosted large runners. |
 
 ## 3. Design
@@ -301,6 +306,9 @@ All 2026-08-08, James:
    (`--yes` to skip), no cross-host lock, no new marker or permissions.
 8. **PAT expiry/invalidity fails loud** with a clear message; no rotation machinery.
 9. **vCPU-quota check**: warn when the account quota caps the fleet below the request.
+10. **Genuinely open source is a hard requirement** ("find it or write it") — added after an
+    adversarial review of RunsOn surfaced its closed server/agent; a follow-up OSS-only landscape
+    sweep (`research/oss-landscape-sweep.md`) found no adoptable alternative, upholding build.
 
 ## 7. Rollout
 
