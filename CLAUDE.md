@@ -138,9 +138,13 @@ a credential on a VM beyond the JIT config. Frame such items as options + a lean
 ## Housekeeping
 
 - This directory is a local git repo (identity `shkolnik-beep` configured repo-locally); there is
-  no remote yet — creating one (likely GitHub, given it's an OSS project) is worth raising with
-  James early, along with the license choice (the design requires the tool itself be genuinely
-  open source; Apache-2.0 or MIT are the natural candidates — his call).
+  no remote yet — James will set up the GitHub server side; push when it exists. License is
+  decided: **AGPL-3.0-only** (James, 2026-08-08 — maximal-control OSI license; he is sole
+  copyright holder and can relicense later; revisit CLA/DCO if outside contributors appear).
+- Implementation follows `implementation-phases.md` (four phases, each with a verification
+  gate); per-phase task plans live in `docs/plans/`. Execution model: subagent-driven
+  development — Sonnet/Opus subagents implement tasks by clarity/complexity, Fable leads and
+  reviews whole-branch / high-importance gates.
 - Keep this CLAUDE.md current as the project grows a real structure (crate layout, build/test
   commands, CI). Replace this Housekeeping section with real onboarding (build commands, test
   invocations, environment notes) as soon as those exist.

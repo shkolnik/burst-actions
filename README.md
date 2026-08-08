@@ -12,8 +12,11 @@ to any one repo — one invocation serves one repo; many repos use the tool.
 | File | What it is |
 |---|---|
 | `CLAUDE.md` | Onboarding for the working agent — read first in a fresh session. |
+| `implementation-phases.md` | The four implementation phases and their verification gates. |
 | `design-proposal.md` | **The approved design.** Requirements, landscape verdict, full design, decision log, rollout plan, starting defaults. |
 | `research/` | Preserved research: the three original commissioned takes (`homelab-landscape.md`, `gha-ecosystem.md`, `first-principles-design.md`), the adversarial buy-vs-build review (`adversarial-runson-review.md`), and the OSS-only landscape sweep (`oss-landscape-sweep.md`). The design proposal supersedes all of them where they disagree. |
 
-Status: design approved 2026-08-08; implementation not yet started (rollout plan in
-`design-proposal.md` §7).
+Status: design approved 2026-08-08; implementation phase 1 in progress
+(`implementation-phases.md`).
+
+License: AGPL-3.0-only.
