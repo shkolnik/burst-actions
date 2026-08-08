@@ -22,14 +22,14 @@ Hard requirements:
 - AWS first; cross-cloud a bonus. Prefer a mature existing tool over invention — but a small owned
   tool beats an enterprise system.
 
-This doc synthesizes three commissioned takes (see `research/`): a homelab-ecosystem survey, a
-GitHub-Actions-ecosystem survey, and a first-principles design.
+Background research lives in `research/` (two ecosystem surveys and a first-principles design);
+this doc supersedes them where they disagree.
 
 ## 2. Landscape verdict: build; RunsOn is the buy-fallback
 
-All three takes converged on the same core mechanism (ephemeral runners + prebaked image +
-instance self-termination + independent kill switch). Every existing *package* of it fails a hard
-requirement:
+Every serious system below is internally built on the same core mechanism — ephemeral runners +
+prebaked image + instance self-termination + independent kill switch — which is what makes a
+small owned implementation of it safe. Every existing *package* of it fails a hard requirement:
 
 | Option | What it is | Why not |
 |---|---|---|
@@ -39,9 +39,6 @@ requirement:
 | **machulav/ec2-github-runner**, **ubergeek77/aws-ec2-spot-runner** | Workflow steps that start/stop EC2 | Zero standing infra (right spirit), but runner lifetime is tied to one workflow run and cleanup rides on a `stop` job a cancelled run can skip. Kept as reference implementations. |
 | **RunsOn** (runs-on.com) | CloudFormation stack in your own account; per-job ephemeral VMs; free for non-commercial | The credible buy option: no k8s, scale-to-zero, actively maintained, no vendor-hosted control plane. Rejected only because it's third-party code holding EC2 rights in our account and the small owned alternative exists. **Fallback: if the DIY tool palls, adopt RunsOn rather than growing it.** |
 | Hosted vendors (WarpBuild, Namespace, …) | Rent their fleet | Vendor-existential risk (BuildJet and Cirrus CI both died H1 2026); spot EC2 is ~2.7× cheaper than GitHub's hosted large runners. |
-
-The pattern is the same one every serious system above uses internally — which is what makes a
-small owned implementation safe to own.
 
 ## 3. Design
 
@@ -124,7 +121,7 @@ next invocation. **Ctrl-C detaches, it does not tear down** — jobs are the val
 watcher exits with "fleet still running — re-run to re-attach, `burst down` to kill." Teardown is
 only ever the explicit `burst down`.
 
-**Concurrency and resumption (per-repo lock + statefile, James 2026-08-08):** two files under
+**Concurrency and resumption (per-repo lock + statefile):** two files under
 `~/.local/state/burst/<owner>-<repo>/` — a lockfile held under an OS advisory lock (`flock`) for
 the process lifetime, and a JSON statefile listing spawned instance IDs, updated by
 write-then-rename so a concurrent reader never sees a torn state. A second invocation while the
@@ -136,7 +133,7 @@ tags stay authoritative), resume watching, then execute its own command if compa
 composes: watch the adopted fleet AND launch N more). If incompatible, warn and keep the resumed
 watch.
 
-**Cross-host concurrency is advisory, not locked** (James 2026-08-08): the hard lock is
+**Cross-host concurrency is advisory, not locked:** the hard lock is
 deliberately per-machine — broad adoption routes invocations through one automation environment
 anyway, and direct human/agent use is on small projects where collisions are rare and cheap.
 The startup cloud query that already drives adoption doubles as the cross-host signal:
@@ -164,8 +161,8 @@ needs local facts and a syscall.)
 ### Cleanup: defense in depth, ranked by reliability
 
 1. **EventBridge Scheduler one-shot kill at launch+TTL** — pure AWS control plane; survives
-   kernel hang, GitHub outage, CLI death, vacation; self-deletes after firing. (The research
-   reports prescribe a standing scheduled reaper here; the per-instance one-shot gives the same
+   kernel hang, GitHub outage, CLI death, vacation; self-deletes after firing. (A standing
+   scheduled reaper is the conventional tool here; the per-instance one-shot gives the same
    guarantee with nothing standing.)
 2. **`instance-initiated-shutdown-behavior=terminate`** — set before boot; the instance profile
    can't call ModifyInstanceAttribute, so nothing on the VM can undo it.
@@ -270,11 +267,11 @@ failure mode cost more maintainer attention than its absence costs money or risk
 ## 5. Implementation notes
 
 Rust, standalone crate — **never a beep workspace member or xtask** — and keep a prebuilt binary
-at hand: "CI is broken" must never block launching more CI runners. (These two rules preserve
-what the first-principles doc's pro-Python argument was actually protecting; as a standalone
-static binary, Rust is the more durable choice — no interpreter/venv drift, and the
-failure-ordering logic is where the type system pays rent.) `aws-sdk-rust` covers everything used:
-EC2, EventBridge Scheduler, IAM, STS, Budgets.
+at hand: "CI is broken" must never block launching more CI runners. (A Python script was the
+considered alternative; its real virtue — always runnable regardless of any repo's build health —
+is preserved by those two rules, and a standalone static binary is the more durable form of it:
+no interpreter/venv drift, and the failure-ordering logic is where the type system pays rent.)
+`aws-sdk-rust` covers everything used: EC2, EventBridge Scheduler, IAM, STS, Budgets.
 
 Known first-run wrinkle: freshly created IAM roles are eventually consistent — a `RunInstances`
 or Scheduler call made seconds after `ensure_substrate()` creates a role can fail with an
@@ -293,7 +290,7 @@ All 2026-08-08, James:
 2. **JIT + ephemeral, one VM per job** (boot cost acceptable given a prebaked AMI).
 3. **AMI kept between runs**, content-addressed by config hash; **one generation**.
 4. **Rust** (`aws-sdk-rust`), standalone crate.
-5. Zero AWS pre-setup; no Terraform/Ansible (litmus tests from the original request).
+5. Zero AWS pre-setup; no Terraform/Ansible.
 6. **One repo per invocation**; repo + project CI config are required inputs. Many repos use the
    tool, one at a time.
 7. **Happy-path invocation is a long-running watcher** with a per-repo `flock` lockfile +
