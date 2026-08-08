@@ -15,6 +15,14 @@ thiserror = "2"
 sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+tokio = { version = "1", features = ["rt"] }
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-sdk-ec2 = "1"
+aws-sdk-scheduler = "1"
+aws-sdk-iam = "1"
+aws-sdk-budgets = "1"
+ureq = { version = "3", features = ["json"] }
+base64 = "0.22"
 
 [dev-dependencies]
 assert_cmd = "2"

@@ -8,14 +8,31 @@ pub enum InstanceState {
     Running,
     ShuttingDown,
     Terminated,
+    Stopping,
+    Stopped,
 }
 
 impl InstanceState {
     pub fn is_live(self) -> bool {
         match self {
-            InstanceState::Pending | InstanceState::Running => true,
+            InstanceState::Pending
+            | InstanceState::Running
+            | InstanceState::Stopping
+            | InstanceState::Stopped => true,
             InstanceState::ShuttingDown | InstanceState::Terminated => false,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopped_instance_is_live() {
+        // A stopped instance still exists and bills EBS: it must be adopted
+        // and swept, never silently dropped.
+        assert!(InstanceState::Stopped.is_live());
     }
 }
 
