@@ -8,6 +8,10 @@ static SCRATCH: LazyLock<TempDir> = LazyLock::new(|| tempfile::tempdir().unwrap(
 fn burst() -> Command {
     let mut cmd = Command::cargo_bin("burst").unwrap();
     cmd.current_dir(SCRATCH.path());
+    // Commands that open the repo statefile (sweep, up, down) do so before
+    // their credential checks fail — without this redirect they'd leave a
+    // lock file for octo/widgets in the user's real state dir.
+    cmd.env("XDG_STATE_HOME", SCRATCH.path());
     cmd
 }
 
@@ -63,11 +67,8 @@ fn down_fails_loud_offline_not_silently() {
 fn up_fails_loud_offline_not_silently() {
     // up's first network step is prepare()'s GitHub call, so removing the
     // token is enough; the AWS sources are stripped too so no path through
-    // this test can touch a real account. XDG_STATE_HOME is redirected so
-    // the lock/statefile land in the scratch dir, not the user's state dir.
-    let d = tempfile::tempdir().unwrap();
+    // this test can touch a real account.
     burst()
-        .env("XDG_STATE_HOME", d.path())
         .env_remove("BURST_GITHUB_TOKEN")
         .env_remove("GITHUB_TOKEN")
         .env_remove("AWS_ACCESS_KEY_ID")
