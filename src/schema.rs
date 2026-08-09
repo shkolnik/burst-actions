@@ -6,6 +6,7 @@ use std::fmt;
 pub const TAG_BURST: &str = "burst-actions";
 pub const TAG_REPO: &str = "burst-actions-repo";
 pub const TAG_EXPIRES: &str = "burst-actions-expires";
+pub const TAG_IMAGE_KEY: &str = "burst-actions-image-key";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoId {

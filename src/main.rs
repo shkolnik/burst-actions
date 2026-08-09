@@ -64,7 +64,7 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    let _config = match burst::config::load(&cwd, cli.repo.as_deref()) {
+    let config = match burst::config::load(&cwd, cli.repo.as_deref()) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("error: {e}");
@@ -74,7 +74,13 @@ fn main() -> ExitCode {
 
     match cli.command {
         Cmd::Up { .. } => not_implemented("up"),
-        Cmd::Bake => not_implemented("bake"),
+        Cmd::Bake => match burst::commands::bake::run(&config) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::Status => not_implemented("status"),
         Cmd::Down { .. } => not_implemented("down"),
         Cmd::Sweep => not_implemented("sweep"),

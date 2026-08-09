@@ -71,6 +71,26 @@ fn render_provision_from(
     Ok(out)
 }
 
+/// Wrap the rendered provisioning script for a bake-time builder run: write
+/// it to disk and execute it. Success touches the bootstrap marker and
+/// powers the builder off, so `CreateImage` finds a stopped instance;
+/// failure leaves the instance running with no marker and no poweroff — the
+/// builder has no SSM access, so the CLI's own bake timeout (not a remote
+/// inspection) is what catches a stuck build.
+pub fn wrap_provision_for_bake(provisioning_script: &str) -> String {
+    format!(
+        "#!/usr/bin/env bash\n\
+         set -uo pipefail\n\
+         install -d -m 0755 /var/lib/burst\n\
+         install -m 0755 -o root -g root /dev/stdin /var/lib/burst/provision.sh <<'BURST_PROVISION_SCRIPT'\n\
+         {provisioning_script}\n\
+         BURST_PROVISION_SCRIPT\n\
+         if /var/lib/burst/provision.sh; then\n\
+         \x20   touch /var/lib/burst/provisioned && poweroff\n\
+         fi\n"
+    )
+}
+
 /// Per-VM launch user-data: writes the single-use JIT config and starts the
 /// runner unit. The bootstrap-deadline and TTL timers are enabled at bake
 /// time and arm on every boot independent of this user-data ever running —
@@ -113,6 +133,28 @@ mod tests {
         let err = render_provision_from(bad_tmpl, 10, 6, "2.320.0").unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("__BURST_TYPO__"), "{msg}");
+    }
+
+    #[test]
+    fn bake_wrapper_powers_off_only_on_success() {
+        let wrapped = wrap_provision_for_bake("echo hi\n");
+        assert!(
+            wrapped.contains("touch /var/lib/burst/provisioned && poweroff"),
+            "{wrapped}"
+        );
+        // No bare `poweroff` on the failure path: every occurrence of
+        // "poweroff" in the wrapper must be the success-only one above.
+        assert_eq!(
+            wrapped.matches("poweroff").count(),
+            1,
+            "expected exactly one poweroff, gated on success: {wrapped}"
+        );
+    }
+
+    #[test]
+    fn bake_wrapper_embeds_the_provisioning_script() {
+        let wrapped = wrap_provision_for_bake("apt-get install -y foo\n");
+        assert!(wrapped.contains("apt-get install -y foo"));
     }
 
     #[test]

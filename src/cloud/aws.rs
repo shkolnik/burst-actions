@@ -1,6 +1,6 @@
 use super::{Cloud, Instance, InstanceState, LaunchSpec};
 use crate::error::Error;
-use crate::schema::{RepoId, TAG_BURST, TAG_REPO};
+use crate::schema::{Arch, RepoId, TAG_BURST, TAG_IMAGE_KEY, TAG_REPO};
 use aws_sdk_ec2::error::ProvideErrorMetadata;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use base64::Engine;
@@ -556,6 +556,73 @@ impl AwsContext {
             }),
         }
     }
+
+    /// The region this context is connected to (for error messages only —
+    /// `effective_region` is the source of truth at connect time).
+    pub fn region_str(&self) -> String {
+        self.ec2
+            .config()
+            .region()
+            .map(|r| r.as_ref().to_string())
+            .unwrap_or_default()
+    }
+
+    /// Resolve the current Ubuntu 24.04 LTS AMI id for `arch`: owner
+    /// Canonical (099720109477), gp3 HVM SSD, newest by creation date.
+    /// Read-only `DescribeImages` — never creates or pins anything; §8.6
+    /// requires the caller to pin the result into `burst.toml` explicitly.
+    pub fn resolve_latest_ubuntu_ami(&self, arch: Arch) -> Result<String, Error> {
+        let arch_name = match arch {
+            Arch::X86_64 => "amd64",
+            Arch::Arm64 => "arm64",
+        };
+        let name_filter =
+            format!("ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-{arch_name}-server-*");
+
+        self.runtime.block_on(async {
+            let out = self
+                .ec2
+                .describe_images()
+                .owners("099720109477")
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name("name")
+                        .values(&name_filter)
+                        .build(),
+                )
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name("state")
+                        .values("available")
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "DescribeImages(ubuntu)",
+                    message: format_aws_error(&e),
+                })?;
+
+            let mut images: Vec<(&str, &str)> = out
+                .images()
+                .iter()
+                .filter_map(|i| Some((i.image_id()?, i.creation_date()?)))
+                .collect();
+            // Newest first: creation_date is ISO8601, so lexicographic order
+            // is chronological order.
+            images.sort_by(|a, b| b.1.cmp(a.1));
+
+            images
+                .first()
+                .map(|(id, _)| id.to_string())
+                .ok_or_else(|| Error::Aws {
+                    op: "DescribeImages(ubuntu)",
+                    message: format!(
+                        "no available Ubuntu 24.04 LTS AMI found for {arch_name} in this region"
+                    ),
+                })
+        })
+    }
 }
 
 /// True for the transient invalid-instance-profile error RunInstances returns
@@ -610,6 +677,54 @@ fn map_instance_state(
 pub struct AwsCloud {
     pub ctx: AwsContext,
     pub substrate: Substrate,
+    /// Target repository — not part of the `Cloud::bake` signature (that
+    /// trait method takes only the content-addressed key), but needed to tag
+    /// and search bake resources by `burst-actions-repo`.
+    pub repo: RepoId,
+    /// The pinned base AMI to launch a builder from when `bake` misses the
+    /// cache (`config.base_ami`, resolved by `commands::bake::run`).
+    pub base_ami: String,
+    /// Instance type for the builder VM.
+    pub builder_instance_type: String,
+    /// The rendered provisioning script `bake` wraps into the builder's
+    /// user-data.
+    pub provisioning_script: String,
+}
+
+/// How long a builder (and its kill schedule) may live: generous enough for
+/// a from-scratch `apt-get install` + toolchain warm, short enough that a
+/// wedged build is capped, not indefinite.
+const BUILDER_TTL_HOURS: i64 = 1;
+/// Poll interval and deadline while waiting for the builder to reach
+/// `Stopped` (provisioning done, or bootstrap-deadline poweroff on failure).
+const STOP_POLL_INTERVAL: Duration = Duration::from_secs(15);
+const STOP_TIMEOUT_MINUTES: u64 = 25;
+/// Poll interval and deadline while waiting for `CreateImage` to finish.
+const IMAGE_POLL_INTERVAL: Duration = Duration::from_secs(30);
+const IMAGE_TIMEOUT_MINUTES: u64 = 20;
+
+/// True iff `tags` carries the ownership tag `burst-actions=1` — the last
+/// check immediately before a destructive call, never trusted from a filter
+/// alone.
+fn is_burst_tagged(tags: &[aws_sdk_ec2::types::Tag]) -> bool {
+    tags.iter()
+        .any(|t| t.key() == Some(TAG_BURST) && t.value() == Some("1"))
+}
+
+/// Select the superseded generation: every image whose `burst-actions-image-key`
+/// tag doesn't match `keep_key`, including images with no readable key tag at
+/// all — a tag-verified burst image without a key is stale by definition,
+/// never protected by omission. One generation only: `images` is expected to
+/// already be filtered to this repo.
+pub(crate) fn superseded<'a>(
+    images: &'a [(String, Option<String>)],
+    keep_key: &str,
+) -> Vec<&'a String> {
+    images
+        .iter()
+        .filter(|(_, key)| key.as_deref() != Some(keep_key))
+        .map(|(id, _)| id)
+        .collect()
 }
 
 fn tag_specification(
@@ -936,11 +1051,404 @@ impl Cloud for AwsCloud {
         })
     }
 
-    fn bake(&mut self, _key: &str) -> Result<String, Error> {
-        Err(Error::Aws {
-            op: "bake",
-            message: "not implemented until task 6/8".to_string(),
+    fn bake(&mut self, key: &str) -> Result<String, Error> {
+        if let Some(id) = self.describe_image_by_key(key)? {
+            println!("image cache hit: {id} ({key})");
+            return Ok(id);
+        }
+
+        let expires = Utc::now() + chrono::Duration::hours(BUILDER_TTL_HOURS);
+        let builder_id = self.launch_builder(expires)?;
+        // Kill-armed before any waiting begins: a SIGKILLed CLI leaks only a
+        // schedule-reaped builder, never a runaway one.
+        self.arm_kill(&builder_id, expires)?;
+
+        self.wait_for_stopped(&builder_id)?;
+
+        let image_id = self.create_image(&builder_id, key)?;
+        self.wait_for_image_available(&image_id)?;
+
+        self.terminate(std::slice::from_ref(&builder_id))?;
+        self.delete_kill_schedule(&builder_id)?;
+
+        self.cleanup_superseded(key)?;
+
+        Ok(image_id)
+    }
+}
+
+impl AwsCloud {
+    /// Cache check: an available AMI we own, tagged for this repo's key.
+    /// Get-or-create semantics — a hit short-circuits before any builder is
+    /// launched.
+    fn describe_image_by_key(&self, key: &str) -> Result<Option<String>, Error> {
+        self.ctx.runtime.block_on(async {
+            let out = self
+                .ctx
+                .ec2
+                .describe_images()
+                .owners("self")
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name(format!("tag:{TAG_BURST}"))
+                        .values("1")
+                        .build(),
+                )
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name(format!("tag:{TAG_IMAGE_KEY}"))
+                        .values(key)
+                        .build(),
+                )
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name("state")
+                        .values("available")
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "DescribeImages(cache check)",
+                    message: format_aws_error(&e),
+                })?;
+            Ok(out
+                .images()
+                .first()
+                .and_then(|i| i.image_id())
+                .map(str::to_string))
         })
+    }
+
+    /// Launch the builder instance: tag triple, `shutdown_behavior = Stop`
+    /// (the one deliberate exception — `CreateImage` needs a stopped
+    /// instance), IMDSv2, our SG/subnet/profile, wrapped provisioning
+    /// user-data.
+    fn launch_builder(&self, expires: DateTime<Utc>) -> Result<String, Error> {
+        let tags = crate::schema::TagSpec {
+            repo: self.repo.clone(),
+            expires,
+        }
+        .to_tags();
+        let instance_tags = tag_specification(aws_sdk_ec2::types::ResourceType::Instance, &tags);
+        let volume_tags = tag_specification(aws_sdk_ec2::types::ResourceType::Volume, &tags);
+
+        let wrapped = crate::payload::wrap_provision_for_bake(&self.provisioning_script);
+        let user_data_b64 = base64::engine::general_purpose::STANDARD.encode(wrapped.as_bytes());
+
+        self.ctx.runtime.block_on(async {
+            let out = self
+                .ctx
+                .ec2
+                .run_instances()
+                .min_count(1)
+                .max_count(1)
+                .image_id(&self.base_ami)
+                .instance_type(aws_sdk_ec2::types::InstanceType::from(
+                    self.builder_instance_type.as_str(),
+                ))
+                .security_group_ids(&self.substrate.security_group_id)
+                .subnet_id(&self.substrate.subnet_id)
+                .iam_instance_profile(
+                    aws_sdk_ec2::types::IamInstanceProfileSpecification::builder()
+                        .name(&self.substrate.instance_profile_name)
+                        .build(),
+                )
+                .user_data(&user_data_b64)
+                .instance_initiated_shutdown_behavior(aws_sdk_ec2::types::ShutdownBehavior::Stop)
+                .metadata_options(
+                    aws_sdk_ec2::types::InstanceMetadataOptionsRequest::builder()
+                        .http_tokens(aws_sdk_ec2::types::HttpTokensState::Required)
+                        .build(),
+                )
+                .tag_specifications(instance_tags)
+                .tag_specifications(volume_tags)
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "RunInstances(builder)",
+                    message: format_aws_error(&e),
+                })?;
+
+            out.instances()
+                .first()
+                .and_then(|i| i.instance_id())
+                .map(str::to_string)
+                .ok_or_else(|| Error::Aws {
+                    op: "RunInstances(builder)",
+                    message: "response had no instance id".to_string(),
+                })
+        })
+    }
+
+    fn describe_instance_state(&self, instance_id: &str) -> Result<InstanceState, Error> {
+        self.ctx.runtime.block_on(async {
+            let out = self
+                .ctx
+                .ec2
+                .describe_instances()
+                .instance_ids(instance_id)
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "DescribeInstances(builder)",
+                    message: format_aws_error(&e),
+                })?;
+            let state = out
+                .reservations()
+                .iter()
+                .flat_map(|r| r.instances())
+                .next()
+                .and_then(|i| i.state())
+                .and_then(|s| s.name())
+                .ok_or_else(|| Error::Aws {
+                    op: "DescribeInstances(builder)",
+                    message: format!("builder {instance_id} not found"),
+                })?;
+            map_instance_state(state)
+        })
+    }
+
+    /// Poll until the builder reaches `Stopped` (provisioning succeeded, or
+    /// the bootstrap-deadline timer powered it off on failure). Past the
+    /// deadline: terminate (tag-verified) and delete the kill schedule
+    /// first — exactly what the timeout error promises — then fail loud.
+    fn wait_for_stopped(&mut self, builder_id: &str) -> Result<(), Error> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(STOP_TIMEOUT_MINUTES * 60);
+        loop {
+            if self.describe_instance_state(builder_id)? == InstanceState::Stopped {
+                return Ok(());
+            }
+            if std::time::Instant::now() >= deadline {
+                self.terminate(&[builder_id.to_string()])?;
+                self.delete_kill_schedule(builder_id)?;
+                return Err(Error::BakeTimeout {
+                    instance_id: builder_id.to_string(),
+                    minutes: STOP_TIMEOUT_MINUTES,
+                });
+            }
+            std::thread::sleep(STOP_POLL_INTERVAL);
+        }
+    }
+
+    /// `CreateImage`, tagging both the image and its snapshot(s) with the
+    /// ownership triple plus the image key.
+    fn create_image(&self, builder_id: &str, key: &str) -> Result<String, Error> {
+        let tags: Vec<(String, String)> = vec![
+            (TAG_BURST.to_string(), "1".to_string()),
+            (TAG_REPO.to_string(), self.repo.to_string()),
+            (TAG_IMAGE_KEY.to_string(), key.to_string()),
+        ];
+        let image_tags = tag_specification(aws_sdk_ec2::types::ResourceType::Image, &tags);
+        let snapshot_tags = tag_specification(aws_sdk_ec2::types::ResourceType::Snapshot, &tags);
+
+        self.ctx.runtime.block_on(async {
+            let out = self
+                .ctx
+                .ec2
+                .create_image()
+                .instance_id(builder_id)
+                .name(format!("burst-actions-{key}"))
+                .tag_specifications(image_tags)
+                .tag_specifications(snapshot_tags)
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "CreateImage",
+                    message: format_aws_error(&e),
+                })?;
+            out.image_id()
+                .map(str::to_string)
+                .ok_or_else(|| Error::Aws {
+                    op: "CreateImage",
+                    message: "response had no image id".to_string(),
+                })
+        })
+    }
+
+    fn describe_image_state(
+        &self,
+        image_id: &str,
+    ) -> Result<aws_sdk_ec2::types::ImageState, Error> {
+        self.ctx.runtime.block_on(async {
+            let out = self
+                .ctx
+                .ec2
+                .describe_images()
+                .image_ids(image_id)
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "DescribeImages(await available)",
+                    message: format_aws_error(&e),
+                })?;
+            out.images()
+                .first()
+                .and_then(|i| i.state())
+                .cloned()
+                .ok_or_else(|| Error::Aws {
+                    op: "DescribeImages(await available)",
+                    message: format!("image {image_id} not found"),
+                })
+        })
+    }
+
+    fn wait_for_image_available(&self, image_id: &str) -> Result<(), Error> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(IMAGE_TIMEOUT_MINUTES * 60);
+        loop {
+            let state = self.describe_image_state(image_id)?;
+            if state == aws_sdk_ec2::types::ImageState::Available {
+                return Ok(());
+            }
+            if state == aws_sdk_ec2::types::ImageState::Failed
+                || state == aws_sdk_ec2::types::ImageState::Error
+            {
+                return Err(Error::Aws {
+                    op: "CreateImage",
+                    message: format!("image {image_id} entered state {state:?}"),
+                });
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(Error::Aws {
+                    op: "CreateImage",
+                    message: format!(
+                        "image {image_id} did not reach 'available' within {IMAGE_TIMEOUT_MINUTES} min"
+                    ),
+                });
+            }
+            std::thread::sleep(IMAGE_POLL_INTERVAL);
+        }
+    }
+
+    /// Best-effort-but-checked delete of a builder's kill schedule: already
+    /// gone (fired, or never armed) is not an error.
+    fn delete_kill_schedule(&self, instance_id: &str) -> Result<(), Error> {
+        self.ctx.runtime.block_on(async {
+            match self
+                .ctx
+                .scheduler
+                .delete_schedule()
+                .name(kill_schedule_name(instance_id))
+                .group_name("default")
+                .send()
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(e)
+                    if e.as_service_error()
+                        .is_some_and(|s| s.is_resource_not_found_exception()) =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(Error::Aws {
+                    op: "DeleteSchedule",
+                    message: format_aws_error(&e),
+                }),
+            }
+        })
+    }
+
+    /// All available images we own, tagged `burst-actions=1` for this repo —
+    /// the search space `superseded` is a pure function over.
+    fn list_repo_images(&self) -> Result<Vec<aws_sdk_ec2::types::Image>, Error> {
+        self.ctx.runtime.block_on(async {
+            let out = self
+                .ctx
+                .ec2
+                .describe_images()
+                .owners("self")
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name(format!("tag:{TAG_BURST}"))
+                        .values("1")
+                        .build(),
+                )
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name(format!("tag:{TAG_REPO}"))
+                        .values(self.repo.to_string())
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "DescribeImages(supersession)",
+                    message: format_aws_error(&e),
+                })?;
+            Ok(out.images().to_vec())
+        })
+    }
+
+    /// One-generation GC: deregister and delete the snapshots of every image
+    /// this repo owns whose image-key isn't `keep_key`, re-verifying
+    /// ownership on each immediately before the destructive calls.
+    fn cleanup_superseded(&mut self, keep_key: &str) -> Result<(), Error> {
+        let images = self.list_repo_images()?;
+        let pairs: Vec<(String, Option<String>)> = images
+            .iter()
+            .filter_map(|img| {
+                let id = img.image_id()?.to_string();
+                let key_tag = img
+                    .tags()
+                    .iter()
+                    .find(|t| t.key() == Some(TAG_IMAGE_KEY))
+                    .and_then(|t| t.value())
+                    .map(str::to_string);
+                Some((id, key_tag))
+            })
+            .collect();
+
+        for stale_id in superseded(&pairs, keep_key) {
+            let image = images
+                .iter()
+                .find(|img| img.image_id() == Some(stale_id.as_str()))
+                .ok_or_else(|| Error::Aws {
+                    op: "DeregisterImage",
+                    message: format!(
+                        "superseded image {stale_id} vanished from the describe result"
+                    ),
+                })?;
+            if !is_burst_tagged(image.tags()) {
+                return Err(Error::Aws {
+                    op: "DeregisterImage",
+                    message: format!(
+                        "refusing to deregister {stale_id}: not verified as carrying burst-actions=1"
+                    ),
+                });
+            }
+            let snapshot_ids: Vec<String> = image
+                .block_device_mappings()
+                .iter()
+                .filter_map(|m| m.ebs().and_then(|e| e.snapshot_id()).map(str::to_string))
+                .collect();
+
+            self.ctx.runtime.block_on(async {
+                self.ctx
+                    .ec2
+                    .deregister_image()
+                    .image_id(stale_id)
+                    .send()
+                    .await
+                    .map_err(|e| Error::Aws {
+                        op: "DeregisterImage",
+                        message: format_aws_error(&e),
+                    })?;
+                for snapshot_id in &snapshot_ids {
+                    self.ctx
+                        .ec2
+                        .delete_snapshot()
+                        .snapshot_id(snapshot_id)
+                        .send()
+                        .await
+                        .map_err(|e| Error::Aws {
+                            op: "DeleteSnapshot",
+                            message: format_aws_error(&e),
+                        })?;
+                }
+                Ok::<(), Error>(())
+            })?;
+        }
+        Ok(())
     }
 }
 
@@ -1171,6 +1679,43 @@ mod tests {
     fn instance_state_mapping_errors_on_unrecognized_name() {
         let weird = aws_sdk_ec2::types::InstanceStateName::from("weird");
         assert!(matches!(map_instance_state(&weird), Err(Error::Aws { .. })));
+    }
+
+    #[test]
+    fn superseded_keeps_only_the_matching_key() {
+        let images = vec![
+            ("ami-old".to_string(), Some("v1-old".to_string())),
+            ("ami-new".to_string(), Some("v1-new".to_string())),
+        ];
+        let stale = superseded(&images, "v1-new");
+        assert_eq!(stale, vec![&"ami-old".to_string()]);
+    }
+
+    #[test]
+    fn superseded_treats_missing_key_tag_as_stale() {
+        let images = vec![
+            ("ami-no-key".to_string(), None),
+            ("ami-new".to_string(), Some("v1-new".to_string())),
+        ];
+        let stale = superseded(&images, "v1-new");
+        assert_eq!(stale, vec![&"ami-no-key".to_string()]);
+    }
+
+    #[test]
+    fn superseded_is_empty_when_all_match() {
+        let images = vec![("ami-new".to_string(), Some("v1-new".to_string()))];
+        assert!(superseded(&images, "v1-new").is_empty());
+    }
+
+    #[test]
+    fn is_burst_tagged_requires_exact_key_and_value() {
+        let tagged = [aws_sdk_ec2::types::Tag::builder()
+            .key(TAG_BURST)
+            .value("1")
+            .build()];
+        assert!(is_burst_tagged(&tagged));
+        let untagged: [aws_sdk_ec2::types::Tag; 0] = [];
+        assert!(!is_burst_tagged(&untagged));
     }
 
     #[test]
