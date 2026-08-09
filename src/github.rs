@@ -1,8 +1,60 @@
 use crate::error::Error;
 use crate::schema::RepoId;
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const DEFAULT_BASE_URL: &str = "https://api.github.com";
+
+/// Fleet runner name: burst-<8 hex chars>. The nonce is the ownership
+/// pattern the registration sweep keys on, so the format is a contract.
+pub fn runner_name(nonce: &str) -> String {
+    format!("burst-{nonce}")
+}
+
+/// Unique-per-mint nonce: 8 lowercase hex chars from time ^ pid ^ counter
+/// (uniqueness within a process is what matters; the counter guarantees it).
+pub fn runner_nonce() -> String {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let count = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let pid = std::process::id() as u64;
+    let mixed = nanos ^ pid ^ count;
+    format!("{:08x}", (mixed as u32))
+}
+
+/// True iff `name` matches the exact pattern runner_name emits:
+/// ^burst-[0-9a-f]{8}$. The home runner (any human-chosen name) must never
+/// match; this is the prove-ownership check before a registration delete.
+pub fn is_burst_runner_name(name: &str) -> bool {
+    name.strip_prefix("burst-").is_some_and(|rest| {
+        rest.len() == 8
+            && rest
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunnerRegistration {
+    pub id: u64,
+    pub name: String,
+    /// GitHub's `status` == "online".
+    pub online: bool,
+    pub busy: bool,
+}
+
+/// Registrations safe to delete: offline, not busy, and burst-named. A JIT
+/// runner that ran its job is deregistered by GitHub automatically — what
+/// remains are never-connected mints (VM died before registering).
+pub fn dead_registrations(rs: &[RunnerRegistration]) -> Vec<&RunnerRegistration> {
+    rs.iter()
+        .filter(|r| !r.online && !r.busy && is_burst_runner_name(&r.name))
+        .collect()
+}
 
 /// A GitHub PAT. `Debug` never prints the secret — logs, panics, and error
 /// messages built from `{:?}` cannot leak it.
@@ -260,7 +312,8 @@ impl Client {
 
     /// Ids of queued workflow runs:
     /// GET /repos/{o}/{r}/actions/runs?status=queued&per_page=100, paginated
-    /// to exhaustion (follow `total_count` vs page size).
+    /// to exhaustion (the loop stops once a page returns fewer than
+    /// `per_page` results).
     pub fn queued_run_ids(&self, repo: &RepoId) -> Result<Vec<u64>, Error> {
         const OP: &str = "GET .../actions/runs?status=queued";
         const PER_PAGE: usize = 100;
@@ -333,11 +386,233 @@ impl Client {
         }
         Ok(total)
     }
+
+    /// GET /repos/{o}/{r}/actions/runners?per_page=100, paginated.
+    pub fn list_runners(&self, repo: &RepoId) -> Result<Vec<RunnerRegistration>, Error> {
+        const OP: &str = "GET .../actions/runners";
+        const PER_PAGE: usize = 100;
+        let mut out = Vec::new();
+        let mut page = 1;
+        loop {
+            let url = format!(
+                "{}/repos/{}/{}/actions/runners?per_page={}&page={}",
+                self.base_url,
+                repo.owner(),
+                repo.name(),
+                PER_PAGE,
+                page
+            );
+            let resp = ureq::get(url)
+                .header("Authorization", format!("Bearer {}", self.token.as_str()))
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "burst")
+                .config()
+                .http_status_as_error(false)
+                .build()
+                .call();
+            let body = Self::read_ok_json(OP, resp)?;
+            let runners = body
+                .get("runners")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| Error::GitHub {
+                    op: OP,
+                    status: 200,
+                    message: "response missing runners".to_string(),
+                })?;
+            let page_len = runners.len();
+            for r in runners {
+                let id = r
+                    .get("id")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| Error::GitHub {
+                        op: OP,
+                        status: 200,
+                        message: "runner entry missing id".to_string(),
+                    })?;
+                let name = r
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| Error::GitHub {
+                        op: OP,
+                        status: 200,
+                        message: "runner entry missing name".to_string(),
+                    })?
+                    .to_string();
+                let online = r.get("status").and_then(|v| v.as_str()) == Some("online");
+                let busy = r.get("busy").and_then(|v| v.as_bool()).unwrap_or(false);
+                out.push(RunnerRegistration {
+                    id,
+                    name,
+                    online,
+                    busy,
+                });
+            }
+            if page_len < PER_PAGE {
+                break;
+            }
+            page += 1;
+        }
+        Ok(out)
+    }
+
+    /// DELETE /repos/{o}/{r}/actions/runners/{id}. Re-verifies ownership at
+    /// the destructive site: refuses (Error::GitHub, op "delete runner")
+    /// unless is_burst_runner_name(name) — even though callers select via
+    /// dead_registrations, the last check lives here. 404 is Ok (GitHub
+    /// GC'd it first — the delete is idempotent).
+    pub fn delete_runner(&self, repo: &RepoId, id: u64, name: &str) -> Result<(), Error> {
+        const OP: &str = "delete runner";
+        if !is_burst_runner_name(name) {
+            return Err(Error::GitHub {
+                op: OP,
+                status: 0,
+                message: format!("refusing to delete non-burst runner {name:?}"),
+            });
+        }
+        let url = format!(
+            "{}/repos/{}/{}/actions/runners/{}",
+            self.base_url,
+            repo.owner(),
+            repo.name(),
+            id
+        );
+        let resp = ureq::delete(url)
+            .header("Authorization", format!("Bearer {}", self.token.as_str()))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "burst")
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .call();
+        let resp = resp.map_err(|e| Error::GitHub {
+            op: OP,
+            status: 0,
+            message: e.to_string(),
+        })?;
+        let status = resp.status().as_u16();
+        if status == 404 || (200..300).contains(&status) {
+            return Ok(());
+        }
+        let mut resp = resp;
+        let body_text = resp.body_mut().read_to_string().unwrap_or_default();
+        let message = serde_json::from_str::<serde_json::Value>(&body_text)
+            .ok()
+            .and_then(|v| {
+                v.get("message")
+                    .and_then(|m| m.as_str())
+                    .map(str::to_string)
+            })
+            .unwrap_or(body_text);
+        Err(Error::GitHub {
+            op: OP,
+            status,
+            message,
+        })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn runner_name_formats_burst_prefix() {
+        assert_eq!(runner_name("deadbeef"), "burst-deadbeef");
+    }
+
+    #[test]
+    fn is_burst_runner_name_accepts_runner_name_output() {
+        assert!(is_burst_runner_name(&runner_name("deadbeef")));
+    }
+
+    #[test]
+    fn is_burst_runner_name_rejects_uppercase_hex() {
+        assert!(!is_burst_runner_name("burst-DEADBEEF"));
+    }
+
+    #[test]
+    fn is_burst_runner_name_rejects_short_suffix() {
+        assert!(!is_burst_runner_name("burst-123"));
+    }
+
+    #[test]
+    fn is_burst_runner_name_rejects_non_burst_name() {
+        assert!(!is_burst_runner_name("my-home-runner"));
+    }
+
+    #[test]
+    fn is_burst_runner_name_rejects_long_suffix() {
+        assert!(!is_burst_runner_name("burst-deadbeef1"));
+    }
+
+    #[test]
+    fn runner_nonce_calls_differ_and_both_accepted() {
+        let a = runner_nonce();
+        let b = runner_nonce();
+        assert_ne!(a, b);
+        assert!(is_burst_runner_name(&runner_name(&a)));
+        assert!(is_burst_runner_name(&runner_name(&b)));
+    }
+
+    #[test]
+    fn dead_registrations_keeps_only_offline_idle_burst_named() {
+        let online_burst = RunnerRegistration {
+            id: 1,
+            name: runner_name("aaaaaaaa"),
+            online: true,
+            busy: false,
+        };
+        let busy_burst = RunnerRegistration {
+            id: 2,
+            name: runner_name("bbbbbbbb"),
+            online: false,
+            busy: true,
+        };
+        let dead_burst = RunnerRegistration {
+            id: 3,
+            name: runner_name("cccccccc"),
+            online: false,
+            busy: false,
+        };
+        let offline_home = RunnerRegistration {
+            id: 4,
+            name: "home".to_string(),
+            online: false,
+            busy: false,
+        };
+        let rs = vec![online_burst, busy_burst, dead_burst.clone(), offline_home];
+        let dead = dead_registrations(&rs);
+        assert_eq!(dead, vec![&dead_burst]);
+    }
+
+    #[test]
+    fn delete_runner_refuses_non_burst_name_before_any_network_call() {
+        let client = Client::new(Token::from("unused"));
+        let repo = RepoId::parse("octo/widgets").unwrap();
+        let err = client.delete_runner(&repo, 1, "home").unwrap_err();
+        match err {
+            Error::GitHub { op, message, .. } => {
+                assert_eq!(op, "delete runner");
+                assert!(message.contains("home"), "{message}");
+            }
+            other @ (Error::RepoInvalid { .. }
+            | Error::ConfigRead { .. }
+            | Error::ConfigInvalid { .. }
+            | Error::RepoMissing
+            | Error::State { .. }
+            | Error::StateCorrupt { .. }
+            | Error::Environment { .. }
+            | Error::LockHeld { .. }
+            | Error::GitHubTokenMissing
+            | Error::RegionMissing
+            | Error::Aws { .. }
+            | Error::NoDefaultVpc { .. }
+            | Error::BakeTimeout { .. }
+            | Error::ForkApprovalTooWeak { .. }
+            | Error::NoDefaultSubnet { .. }
+            | Error::PartialLaunch { .. }) => panic!("expected Error::GitHub, got {other:?}"),
+        }
+    }
 
     #[test]
     fn count_queued_burst_jobs_counts_queued_job_labeled_burst() {
