@@ -14,19 +14,29 @@ jobs:
     outputs:
       ids: ${{ steps.gen.outputs.ids }}
       sleep: ${{ steps.gen.outputs.sleep }}
+      home: ${{ steps.gen.outputs.home }}
     steps:
       - uses: actions/checkout@v4
       - id: gen
         run: |
-          read -r n sleep < .github/gate-trigger
+          read -r n sleep home < .github/gate-trigger
           ids=$(seq 1 "$n" | jq -cs .)
           echo "ids=$ids" >> "$GITHUB_OUTPUT"
           echo "sleep=$sleep" >> "$GITHUB_OUTPUT"
+          echo "home=${home:-}" >> "$GITHUB_OUTPUT"
   burst:
     needs: plan
     strategy:
       matrix:
         id: ${{ fromJSON(needs.plan.outputs.ids) }}
     runs-on: [self-hosted, burst]
+    steps:
+      - run: sleep ${{ needs.plan.outputs.sleep }}
+  # G9 decoy: a queued job burst's label filter must NOT count. No runner in
+  # this repo has the `home` label, so it queues until the run is cancelled.
+  home:
+    needs: plan
+    if: needs.plan.outputs.home == 'home'
+    runs-on: [self-hosted, home]
     steps:
       - run: sleep ${{ needs.plan.outputs.sleep }}
