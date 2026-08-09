@@ -57,7 +57,7 @@ pub fn plan(
     }
 
     for id in armed {
-        let live_elsewhere = all_live.iter().any(|i| &i.id == id);
+        let live_elsewhere = all_live.iter().any(|i| &i.id == id && i.state.is_live());
         if !live_elsewhere {
             actions.push(SweepAction::DisarmOrphanSchedule {
                 instance_id: id.clone(),
@@ -242,6 +242,23 @@ mod tests {
             actions,
             vec![SweepAction::DisarmOrphanSchedule {
                 instance_id: "i-gone".into()
+            }]
+        );
+    }
+
+    #[test]
+    fn armed_kill_for_shutting_down_instance_is_an_orphan() {
+        // list_all_tagged includes ShuttingDown instances, but
+        // ShuttingDown.is_live() is false — a schedule for one must still be
+        // planned as an orphan, matching reconcile::reconcile's precedent of
+        // filtering on is_live() rather than mere id presence.
+        let mut shutting_down = inst("i-going", Some("2026-08-09T18:00:00+00:00"));
+        shutting_down.state = InstanceState::ShuttingDown;
+        let actions = plan(now(), &[], &[shutting_down], &["i-going".to_string()], &[]);
+        assert_eq!(
+            actions,
+            vec![SweepAction::DisarmOrphanSchedule {
+                instance_id: "i-going".into()
             }]
         );
     }
