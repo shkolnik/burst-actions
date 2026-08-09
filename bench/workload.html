@@ -1,0 +1,39 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>burst-bench</title>
+<canvas id="c" width="800" height="600"></canvas>
+<div id="arena"></div>
+<script>
+// Deterministic browser workload: DOM layout thrash, canvas raster, JSON churn.
+// ?iters=N scales one run; console "CHUNK_DONE" is the completion signal that
+// run-bench.sh greps from chromium's --enable-logging=stderr stream.
+const iters = Number(new URLSearchParams(location.search).get('iters') || 200);
+const seed = Number(new URLSearchParams(location.search).get('seed') || 1);
+let s = seed >>> 0;
+const rnd = () => (s = (s * 1664525 + 1013904223) >>> 0) / 2 ** 32;
+const arena = document.getElementById('arena');
+const ctx = document.getElementById('c').getContext('2d');
+let sink = 0;
+function chunk(i) {
+  arena.innerHTML = '';
+  for (let k = 0; k < 300; k++) {
+    const d = document.createElement('div');
+    d.textContent = 'row ' + k + ' ' + rnd().toFixed(6);
+    d.style.width = 100 + (k % 200) + 'px';
+    arena.appendChild(d);
+  }
+  sink += arena.offsetHeight; // force layout
+  for (let k = 0; k < 200; k++) {
+    ctx.fillStyle = `hsl(${(k * 7) % 360},60%,50%)`;
+    ctx.beginPath();
+    ctx.arc(rnd() * 800, rnd() * 600, 5 + rnd() * 40, 0, 7);
+    ctx.fill();
+  }
+  const obj = {};
+  for (let k = 0; k < 500; k++) obj['k' + k] = rnd().toString(36).repeat(20);
+  sink += JSON.parse(JSON.stringify(obj))['k0'].length;
+  if (i + 1 < iters) setTimeout(() => chunk(i + 1), 0);
+  else console.log(`CHUNK_DONE seed=${seed} sink=${sink}`);
+}
+chunk(0);
+</script>
