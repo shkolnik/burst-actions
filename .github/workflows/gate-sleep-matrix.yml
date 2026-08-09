@@ -2,26 +2,26 @@
 # (implementation-phases.md Task 12). Manually dispatched only; remove after
 # the gate.
 name: gate-sleep-matrix
+# Trigger: push a change to .github/gate-trigger whose first line is
+# "<jobs> <sleep-seconds>" (PAT lacks workflow_dispatch permission).
 on:
-  workflow_dispatch:
-    inputs:
-      jobs:
-        description: "number of matrix jobs"
-        default: "4"
-      sleep:
-        description: "seconds each job sleeps"
-        default: "120"
+  push:
+    branches: [phase-3-fleet-lifecycle]
+    paths: [".github/gate-trigger"]
 jobs:
   plan:
     runs-on: ubuntu-latest
     outputs:
       ids: ${{ steps.gen.outputs.ids }}
+      sleep: ${{ steps.gen.outputs.sleep }}
     steps:
+      - uses: actions/checkout@v4
       - id: gen
         run: |
-          n=${{ github.event.inputs.jobs }}
+          read -r n sleep < .github/gate-trigger
           ids=$(seq 1 "$n" | jq -cs .)
           echo "ids=$ids" >> "$GITHUB_OUTPUT"
+          echo "sleep=$sleep" >> "$GITHUB_OUTPUT"
   burst:
     needs: plan
     strategy:
@@ -29,4 +29,4 @@ jobs:
         id: ${{ fromJSON(needs.plan.outputs.ids) }}
     runs-on: [self-hosted, burst]
     steps:
-      - run: sleep ${{ github.event.inputs.sleep }}
+      - run: sleep ${{ needs.plan.outputs.sleep }}
