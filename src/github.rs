@@ -61,6 +61,50 @@ pub fn jit_request_body(runner_name: &str) -> serde_json::Value {
     })
 }
 
+/// The repo's "approval for fork pull-request workflows" policy — a closed
+/// set; an unrecognized API value is a loud error, never a permissive
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForkApprovalPolicy {
+    /// Every outside collaborator's workflow needs approval — the only
+    /// policy burst accepts.
+    AllExternalContributors,
+    FirstTimeContributors,
+    FirstTimeContributorsNewToGitHub,
+}
+
+pub fn parse_approval_policy(s: &str) -> Result<ForkApprovalPolicy, Error> {
+    match s {
+        "all_external_contributors" => Ok(ForkApprovalPolicy::AllExternalContributors),
+        "first_time_contributors" => Ok(ForkApprovalPolicy::FirstTimeContributors),
+        "first_time_contributors_new_to_github" => {
+            Ok(ForkApprovalPolicy::FirstTimeContributorsNewToGitHub)
+        }
+        other => Err(Error::GitHub {
+            op: "parse approval_policy",
+            status: 200,
+            message: format!("unrecognized approval_policy value: {other:?}"),
+        }),
+    }
+}
+
+/// Invariant 5. Hard error unless the policy is AllExternalContributors.
+/// There is deliberately no bypass parameter — the signature cannot express
+/// "skip the check".
+pub fn preflight_fork_approval(repo: &RepoId, policy: ForkApprovalPolicy) -> Result<(), Error> {
+    match policy {
+        ForkApprovalPolicy::AllExternalContributors => Ok(()),
+        ForkApprovalPolicy::FirstTimeContributors => Err(Error::ForkApprovalTooWeak {
+            repo: repo.to_string(),
+            found: "only first-time contributors need approval".to_string(),
+        }),
+        ForkApprovalPolicy::FirstTimeContributorsNewToGitHub => Err(Error::ForkApprovalTooWeak {
+            repo: repo.to_string(),
+            found: "only first-time contributors new to GitHub need approval".to_string(),
+        }),
+    }
+}
+
 pub struct Client {
     token: Token,
     base_url: String,
@@ -166,6 +210,35 @@ impl Client {
                 message: "response missing encoded_jit_config".to_string(),
             })
     }
+
+    /// GET /repos/{owner}/{repo}/actions/permissions/fork-pr-contributor-approval
+    pub fn fork_approval_policy(&self, repo: &RepoId) -> Result<ForkApprovalPolicy, Error> {
+        const OP: &str = "GET .../actions/permissions/fork-pr-contributor-approval";
+        let url = format!(
+            "{}/repos/{}/{}/actions/permissions/fork-pr-contributor-approval",
+            self.base_url,
+            repo.owner(),
+            repo.name()
+        );
+        let resp = ureq::get(url)
+            .header("Authorization", format!("Bearer {}", self.token.as_str()))
+            .header("X-GitHub-Api-Version", "2022-11-28")
+            .header("User-Agent", "burst")
+            .config()
+            .http_status_as_error(false)
+            .build()
+            .call();
+        let body = Self::read_ok_json(OP, resp)?;
+        let value = body
+            .get("approval_policy")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| Error::GitHub {
+                op: OP,
+                status: 200,
+                message: "response missing approval_policy".to_string(),
+            })?;
+        parse_approval_policy(value)
+    }
 }
 
 #[cfg(test)]
@@ -226,5 +299,106 @@ mod tests {
     fn token_from_errors_when_both_missing() {
         let err = token_from(|_| None).unwrap_err();
         assert!(matches!(err, Error::GitHubTokenMissing));
+    }
+
+    #[test]
+    fn parse_approval_policy_maps_all_three_strings() {
+        assert_eq!(
+            parse_approval_policy("all_external_contributors").unwrap(),
+            ForkApprovalPolicy::AllExternalContributors
+        );
+        assert_eq!(
+            parse_approval_policy("first_time_contributors").unwrap(),
+            ForkApprovalPolicy::FirstTimeContributors
+        );
+        assert_eq!(
+            parse_approval_policy("first_time_contributors_new_to_github").unwrap(),
+            ForkApprovalPolicy::FirstTimeContributorsNewToGitHub
+        );
+    }
+
+    #[test]
+    fn parse_approval_policy_errors_on_unrecognized_value_naming_it() {
+        let err = parse_approval_policy("totally_new_value").unwrap_err();
+        match err {
+            Error::GitHub {
+                op,
+                status,
+                message,
+            } => {
+                assert_eq!(op, "parse approval_policy");
+                assert_eq!(status, 200);
+                assert!(message.contains("totally_new_value"));
+            }
+            other @ (Error::RepoInvalid { .. }
+            | Error::ConfigRead { .. }
+            | Error::ConfigInvalid { .. }
+            | Error::RepoMissing
+            | Error::State { .. }
+            | Error::StateCorrupt { .. }
+            | Error::Environment { .. }
+            | Error::LockHeld { .. }
+            | Error::GitHubTokenMissing
+            | Error::RegionMissing
+            | Error::Aws { .. }
+            | Error::NoDefaultVpc { .. }
+            | Error::BakeTimeout { .. }
+            | Error::ForkApprovalTooWeak { .. }
+            | Error::NoDefaultSubnet { .. }
+            | Error::PartialLaunch { .. }) => panic!("expected Error::GitHub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn preflight_fork_approval_passes_only_all_external_contributors() {
+        let repo = RepoId::parse("octo/widgets").unwrap();
+        assert!(
+            preflight_fork_approval(&repo, ForkApprovalPolicy::AllExternalContributors).is_ok()
+        );
+        assert!(preflight_fork_approval(&repo, ForkApprovalPolicy::FirstTimeContributors).is_err());
+        assert!(
+            preflight_fork_approval(&repo, ForkApprovalPolicy::FirstTimeContributorsNewToGitHub)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn preflight_fork_approval_rejection_names_repo_and_finding_and_remedy() {
+        let repo = RepoId::parse("octo/widgets").unwrap();
+        for policy in [
+            ForkApprovalPolicy::FirstTimeContributors,
+            ForkApprovalPolicy::FirstTimeContributorsNewToGitHub,
+        ] {
+            let err = preflight_fork_approval(&repo, policy).unwrap_err();
+            let message = err.to_string();
+            assert!(message.contains("octo/widgets"), "{message}");
+            assert!(
+                message.contains("Require approval for all external contributors"),
+                "{message}"
+            );
+            match &err {
+                Error::ForkApprovalTooWeak { found, .. } => {
+                    assert!(!found.is_empty(), "{message}");
+                }
+                other @ (Error::RepoInvalid { .. }
+                | Error::ConfigRead { .. }
+                | Error::ConfigInvalid { .. }
+                | Error::RepoMissing
+                | Error::State { .. }
+                | Error::StateCorrupt { .. }
+                | Error::Environment { .. }
+                | Error::LockHeld { .. }
+                | Error::GitHubTokenMissing
+                | Error::GitHub { .. }
+                | Error::RegionMissing
+                | Error::Aws { .. }
+                | Error::NoDefaultVpc { .. }
+                | Error::BakeTimeout { .. }
+                | Error::NoDefaultSubnet { .. }
+                | Error::PartialLaunch { .. }) => {
+                    panic!("expected Error::ForkApprovalTooWeak, got {other:?}")
+                }
+            }
+        }
     }
 }
