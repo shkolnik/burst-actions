@@ -253,7 +253,7 @@ mode not dispatched; the script must exclude it from every number.)
 set -euo pipefail
 price=${1:?usage: report.sh PRICE_PER_HOUR < jobs.json}
 jq -r --arg price "$price" '
-  def t: sub("Z$"; "+00:00") | fromdate;
+  def t: fromdateiso8601;
   .jobs
   # the mode not dispatched still appears as a skipped job — drop it
   | map(select(.conclusion != "skipped"))
