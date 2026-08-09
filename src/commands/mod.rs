@@ -4,3 +4,4 @@
 
 pub mod bake;
 pub mod image;
+pub mod sweep;

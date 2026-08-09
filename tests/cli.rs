@@ -38,13 +38,28 @@ fn up_n_and_auto_conflict() {
 
 #[test]
 fn subcommands_fail_loud_not_silent() {
-    for cmd in ["status", "sweep"] {
-        burst()
-            .args([cmd, "--repo", "octo/widgets"])
-            .assert()
-            .code(1)
-            .stderr(predicate::str::contains("not implemented yet"));
-    }
+    burst()
+        .args(["status", "--repo", "octo/widgets"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("not implemented yet"));
+}
+
+#[test]
+fn sweep_fails_loud_offline_not_silently() {
+    // No credentials, no GitHub token: sweep now does real work instead of
+    // `not_implemented`, but must still fail loud — exit 1, a clear
+    // stderr reason — rather than silently doing nothing.
+    burst()
+        .env_remove("BURST_GITHUB_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .args(["sweep", "--repo", "octo/widgets"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("error:"));
 }
 
 #[test]
