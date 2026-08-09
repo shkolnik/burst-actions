@@ -72,12 +72,31 @@ pub fn run(config: &Config, yes: bool) -> Result<(), Error> {
 
     teardown(&mut cloud, &ids)?;
 
+    let repo_state = RepoState::open(&config.repo)?;
+    // Registration tidy is manifest-scoped: only names this host's statefile
+    // minted are candidates. No statefile (e.g. tearing down an adopted
+    // fleet) ⇒ nothing here is ours to delete on GitHub.
+    let minted: Vec<String> = match repo_state.read() {
+        Ok(m) => m
+            .map(|m| {
+                m.instances
+                    .iter()
+                    .filter_map(|r| r.runner.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        Err(e) => {
+            eprintln!(
+                "warning: statefile unreadable — skipping GitHub registration tidy (instances are already down): {e}"
+            );
+            Vec::new()
+        }
+    };
     super::sweep::tidy_dead_registrations(
         github::token_from_env().map(github::Client::new),
         &config.repo,
+        &minted,
     );
-
-    let repo_state = RepoState::open(&config.repo)?;
     match repo_state.lock() {
         Ok(_lock) => repo_state.delete()?,
         Err(Error::LockHeld { .. }) => {

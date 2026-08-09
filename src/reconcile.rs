@@ -43,6 +43,10 @@ pub fn reconcile(state: &StateFile, cloud: &[Instance]) -> Reconciled {
             .unwrap_or(DateTime::UNIX_EPOCH);
         live.push(InstanceRecord {
             id: inst.id.clone(),
+            // Adopted: its JIT config (and so its runner name) was minted
+            // elsewhere — this manifest can watch it die but never tidy its
+            // registration.
+            runner: None,
             launched_at: DateTime::UNIX_EPOCH,
             expires_at,
         });
@@ -65,6 +69,7 @@ mod tests {
         let t = Utc.with_ymd_and_hms(2026, 8, 8, 12, 0, 0).unwrap();
         InstanceRecord {
             id: id.into(),
+            runner: Some(format!("burst-{id}")),
             launched_at: t,
             expires_at: t,
         }

@@ -47,12 +47,19 @@ pub struct RunnerRegistration {
     pub busy: bool,
 }
 
-/// Registrations safe to delete: offline, not busy, and burst-named. A JIT
-/// runner that ran its job is deregistered by GitHub automatically — what
-/// remains are never-connected mints (VM died before registering).
-pub fn dead_registrations(rs: &[RunnerRegistration]) -> Vec<&RunnerRegistration> {
+/// Registrations safe to delete: offline, not busy, and named in `minted` —
+/// the runner names this host's manifest created. A JIT runner that ran its
+/// job is deregistered by GitHub automatically — what remains are
+/// never-connected mints (VM died before registering). Manifest scoping is
+/// what makes "offline" unambiguous: a registration we didn't mint may be a
+/// concurrent invocation's still-booting runner, which is indistinguishable
+/// from a corpse by the API alone, so it is simply never ours to judge.
+pub fn dead_registrations<'r>(
+    rs: &'r [RunnerRegistration],
+    minted: &[String],
+) -> Vec<&'r RunnerRegistration> {
     rs.iter()
-        .filter(|r| !r.online && !r.busy && is_burst_runner_name(&r.name))
+        .filter(|r| !r.online && !r.busy && minted.iter().any(|m| m == &r.name))
         .collect()
 }
 
@@ -555,7 +562,7 @@ mod tests {
     }
 
     #[test]
-    fn dead_registrations_keeps_only_offline_idle_burst_named() {
+    fn dead_registrations_keeps_only_offline_idle_minted_names() {
         let online_burst = RunnerRegistration {
             id: 1,
             name: runner_name("aaaaaaaa"),
@@ -580,8 +587,28 @@ mod tests {
             online: false,
             busy: false,
         };
-        let rs = vec![online_burst, busy_burst, dead_burst.clone(), offline_home];
-        let dead = dead_registrations(&rs);
+        // Minted by this manifest but not offered for deletion: online/busy.
+        // Offline but never minted here (another invocation's, or the home
+        // runner): out of scope entirely.
+        let unminted_burst = RunnerRegistration {
+            id: 5,
+            name: runner_name("dddddddd"),
+            online: false,
+            busy: false,
+        };
+        let minted = vec![
+            runner_name("aaaaaaaa"),
+            runner_name("bbbbbbbb"),
+            runner_name("cccccccc"),
+        ];
+        let rs = vec![
+            online_burst,
+            busy_burst,
+            dead_burst.clone(),
+            offline_home,
+            unminted_burst,
+        ];
+        let dead = dead_registrations(&rs, &minted);
         assert_eq!(dead, vec![&dead_burst]);
     }
 

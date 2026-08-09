@@ -109,6 +109,7 @@ pub fn launch_fleet(
 
         manifest.instances.push(InstanceRecord {
             id: instance.id,
+            runner: Some(name),
             launched_at: Utc::now(),
             expires_at: expires,
         });
@@ -141,15 +142,25 @@ fn sleep_unless_detached(detach: &AtomicBool, total: Duration, slice: Duration) 
     }
 }
 
+/// Watch is scoped to the local manifest: only `ids` (the instances this
+/// invocation launched or knowingly adopted) count as fleet. A concurrent
+/// invocation's instances — even same repo, same tags — are invisible here,
+/// so this watcher exits when *its* fleet is gone, not when the repo
+/// quiesces.
 pub fn watch(
     cloud: &mut impl Cloud,
     repo: &RepoId,
+    ids: &[String],
     detach: &AtomicBool,
     poll: Duration,
 ) -> Result<WatchOutcome, Error> {
     let mut last: Option<usize> = None;
     loop {
-        let live = cloud.list_tagged(repo)?.len();
+        let live = cloud
+            .list_tagged(repo)?
+            .iter()
+            .filter(|i| ids.iter().any(|id| id == &i.id))
+            .count();
         if last != Some(live) {
             println!("fleet: {live} live");
             last = Some(live);
@@ -229,10 +240,16 @@ pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
     // 4. Sweep-on-entry: rent paid on entry. It terminates instances — possibly
     //    ones just reported as adopted — so it reports every action, in sweep's
     //    own wording. Silence here would be a second spelling of one event.
+    let minted_so_far: Vec<String> = manifest
+        .instances
+        .iter()
+        .filter_map(|r| r.runner.clone())
+        .collect();
     for line in sweep_report(&super::sweep::sweep_with(
         &mut p.cloud,
         &p.client,
         &config.repo,
+        &minted_so_far,
     )?) {
         println!("{line}");
     }
@@ -290,7 +307,14 @@ pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
 
     // 10. Watch — observer only (invariant 3).
     let _ = ctrlc::set_handler(|| DETACH.store(true, Ordering::SeqCst));
-    match watch(&mut p.cloud, &config.repo, &DETACH, Duration::from_secs(30))? {
+    let watch_ids: Vec<String> = manifest.instances.iter().map(|r| r.id.clone()).collect();
+    match watch(
+        &mut p.cloud,
+        &config.repo,
+        &watch_ids,
+        &DETACH,
+        Duration::from_secs(30),
+    )? {
         WatchOutcome::Detached { live } => {
             println!(
                 "detaching — fleet still running ({live} instances); it will finish and self-terminate. Re-run `burst up` to re-attach, `burst down` to tear down"
@@ -304,7 +328,12 @@ pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
             for rec in &manifest.instances {
                 p.cloud.disarm_kill(&rec.id)?;
             }
-            super::sweep::tidy_dead_registrations(Ok(p.client), &config.repo);
+            let minted: Vec<String> = manifest
+                .instances
+                .iter()
+                .filter_map(|r| r.runner.clone())
+                .collect();
+            super::sweep::tidy_dead_registrations(Ok(p.client), &config.repo, &minted);
             state.delete()?;
             println!("fleet drained — all clean");
             Ok(())
@@ -605,7 +634,14 @@ mod tests {
         };
         let detach = AtomicBool::new(false);
         assert_eq!(
-            watch(&mut cloud, &repo(), &detach, Duration::ZERO).unwrap(),
+            watch(
+                &mut cloud,
+                &repo(),
+                &["i-aaa".to_string()],
+                &detach,
+                Duration::ZERO
+            )
+            .unwrap(),
             WatchOutcome::FleetGone
         );
         assert_eq!(cloud.polls.get(), 2, "must have polled again, not guessed");
@@ -692,13 +728,46 @@ mod tests {
         plant(&mut cloud, "i-bbb");
         let detach = AtomicBool::new(true);
         assert_eq!(
-            watch(&mut cloud, &repo(), &detach, Duration::ZERO).unwrap(),
+            watch(
+                &mut cloud,
+                &repo(),
+                &["i-aaa".to_string(), "i-bbb".to_string()],
+                &detach,
+                Duration::ZERO
+            )
+            .unwrap(),
             WatchOutcome::Detached { live: 2 }
         );
         assert_eq!(
             cloud.list_tagged(&repo()).unwrap().len(),
             2,
             "watch observes only — detaching must never terminate anything"
+        );
+    }
+
+    #[test]
+    fn watch_ignores_same_repo_instances_outside_the_manifest() {
+        // A concurrent invocation's instance carries identical tags; only
+        // the manifest ids count as this watcher's fleet, so it exits even
+        // though the repo still has a live tagged instance.
+        let mut cloud = FakeCloud::default();
+        plant(&mut cloud, "i-foreign");
+        let detach = AtomicBool::new(false);
+        assert_eq!(
+            watch(
+                &mut cloud,
+                &repo(),
+                &["i-mine".to_string()],
+                &detach,
+                Duration::ZERO
+            )
+            .unwrap(),
+            WatchOutcome::FleetGone
+        );
+        assert_eq!(
+            cloud.list_tagged(&repo()).unwrap().len(),
+            1,
+            "the foreign instance must be untouched and still live"
         );
     }
 

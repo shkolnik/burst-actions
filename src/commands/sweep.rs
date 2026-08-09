@@ -45,6 +45,7 @@ pub fn plan(
     all_live: &[Instance],
     armed: &[String],
     runners: &[github::RunnerRegistration],
+    minted: &[String],
 ) -> Vec<SweepAction> {
     let mut actions = Vec::new();
 
@@ -65,7 +66,7 @@ pub fn plan(
         }
     }
 
-    for r in github::dead_registrations(runners) {
+    for r in github::dead_registrations(runners, minted) {
         actions.push(SweepAction::DeleteDeadRegistration {
             id: r.id,
             name: r.name.clone(),
@@ -145,10 +146,17 @@ pub(crate) fn describe(action: &SweepAction) -> String {
 /// `Result` so a failure to even construct one (e.g. `down`'s
 /// `token_from_env`) is reported through the same one-spelling path as an
 /// API failure.
-pub(crate) fn tidy_dead_registrations(client: Result<github::Client, Error>, repo: &RepoId) {
+pub(crate) fn tidy_dead_registrations(
+    client: Result<github::Client, Error>,
+    repo: &RepoId,
+    minted: &[String],
+) {
+    if minted.is_empty() {
+        return;
+    }
     let result = client.and_then(|client| {
         let runners = client.list_runners(repo)?;
-        for r in github::dead_registrations(&runners) {
+        for r in github::dead_registrations(&runners, minted) {
             client.delete_runner(repo, r.id, &r.name)?;
         }
         Ok(())
@@ -166,13 +174,27 @@ pub fn sweep_with(
     cloud: &mut crate::cloud::aws::AwsCloud,
     client: &github::Client,
     repo: &RepoId,
+    minted: &[String],
 ) -> Result<Vec<SweepAction>, Error> {
     let repo_instances = cloud.list_tagged(repo)?;
     let all_live = cloud.list_all_tagged()?;
     let armed = cloud.list_armed_kills()?;
-    let runners = client.list_runners(repo)?;
+    // Registrations are manifest-scoped; skip the GitHub listing entirely
+    // when this host minted nothing to look for.
+    let runners = if minted.is_empty() {
+        Vec::new()
+    } else {
+        client.list_runners(repo)?
+    };
 
-    let actions = plan(Utc::now(), &repo_instances, &all_live, &armed, &runners);
+    let actions = plan(
+        Utc::now(),
+        &repo_instances,
+        &all_live,
+        &armed,
+        &runners,
+        minted,
+    );
     execute(cloud, client, repo, &actions)?;
     Ok(actions)
 }
@@ -195,8 +217,20 @@ fn run_locked(
     config: &crate::config::Config,
 ) -> Result<(), Error> {
     let _lock = state.lock()?;
+    // Registration tidy is manifest-scoped: only names this host's
+    // statefile minted are ever candidates. No statefile ⇒ no names ⇒ the
+    // GitHub side of the sweep has nothing it is entitled to touch.
+    let minted: Vec<String> = state
+        .read()?
+        .map(|m| {
+            m.instances
+                .iter()
+                .filter_map(|r| r.runner.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut p = super::image::prepare(config)?;
-    let actions = sweep_with(&mut p.cloud, &p.client, &config.repo)?;
+    let actions = sweep_with(&mut p.cloud, &p.client, &config.repo, &minted)?;
     if actions.is_empty() {
         println!("sweep: nothing to do");
     } else {
@@ -248,7 +282,7 @@ mod tests {
     fn expired_instance_selected_unexpired_not() {
         let expired = inst("i-old", Some("2026-08-09T11:00:00+00:00"));
         let live = inst("i-new", Some("2026-08-09T18:00:00+00:00"));
-        let actions = plan(now(), &[expired.clone(), live], &[], &[], &[]);
+        let actions = plan(now(), &[expired.clone(), live], &[], &[], &[], &[]);
         assert_eq!(
             actions,
             vec![SweepAction::TerminateExpired {
@@ -260,7 +294,7 @@ mod tests {
     #[test]
     fn missing_expiry_tag_is_selected() {
         let i = inst("i-notag", None);
-        let actions = plan(now(), &[i], &[], &[], &[]);
+        let actions = plan(now(), &[i], &[], &[], &[], &[]);
         assert_eq!(
             actions,
             vec![SweepAction::TerminateExpired {
@@ -272,7 +306,7 @@ mod tests {
     #[test]
     fn garbled_expiry_date_is_selected() {
         let i = inst("i-garbled", Some("not-a-date"));
-        let actions = plan(now(), &[i], &[], &[], &[]);
+        let actions = plan(now(), &[i], &[], &[], &[], &[]);
         assert_eq!(
             actions,
             vec![SweepAction::TerminateExpired {
@@ -290,13 +324,14 @@ mod tests {
             &[other_repo_live],
             &["i-other".to_string()],
             &[],
+            &[],
         );
         assert!(actions.is_empty());
     }
 
     #[test]
     fn armed_kill_for_nowhere_live_instance_is_an_orphan() {
-        let actions = plan(now(), &[], &[], &["i-gone".to_string()], &[]);
+        let actions = plan(now(), &[], &[], &["i-gone".to_string()], &[], &[]);
         assert_eq!(
             actions,
             vec![SweepAction::DisarmOrphanSchedule {
@@ -313,7 +348,14 @@ mod tests {
         // filtering on is_live() rather than mere id presence.
         let mut shutting_down = inst("i-going", Some("2026-08-09T18:00:00+00:00"));
         shutting_down.state = InstanceState::ShuttingDown;
-        let actions = plan(now(), &[], &[shutting_down], &["i-going".to_string()], &[]);
+        let actions = plan(
+            now(),
+            &[],
+            &[shutting_down],
+            &["i-going".to_string()],
+            &[],
+            &[],
+        );
         assert_eq!(
             actions,
             vec![SweepAction::DisarmOrphanSchedule {
@@ -328,7 +370,19 @@ mod tests {
         let online = runner(1, "burst-aaaaaaaa", true, false);
         let busy = runner(2, "burst-bbbbbbbb", false, true);
         let home = runner(4, "home", false, false);
-        let actions = plan(now(), &[], &[], &[], &[dead.clone(), online, busy, home]);
+        let minted = vec![
+            "burst-cccccccc".to_string(),
+            "burst-aaaaaaaa".to_string(),
+            "burst-bbbbbbbb".to_string(),
+        ];
+        let actions = plan(
+            now(),
+            &[],
+            &[],
+            &[],
+            &[dead.clone(), online, busy, home],
+            &minted,
+        );
         assert_eq!(
             actions,
             vec![SweepAction::DeleteDeadRegistration {
@@ -340,7 +394,7 @@ mod tests {
 
     #[test]
     fn empty_inputs_yield_empty_plan() {
-        assert!(plan(now(), &[], &[], &[], &[]).is_empty());
+        assert!(plan(now(), &[], &[], &[], &[], &[]).is_empty());
     }
 
     #[test]
@@ -353,7 +407,7 @@ mod tests {
         cloud.arm_kill("i-racing", now()).unwrap();
 
         // Plan sees no live instance anywhere ⇒ orphan.
-        let actions = plan(now(), &[], &[], &["i-racing".to_string()], &[]);
+        let actions = plan(now(), &[], &[], &["i-racing".to_string()], &[], &[]);
         assert_eq!(
             actions,
             vec![SweepAction::DisarmOrphanSchedule {
@@ -414,7 +468,7 @@ mod tests {
         let repo_instances = cloud.list_tagged(&repo).unwrap();
         let all_live = cloud.list_all_tagged().unwrap();
         let armed = cloud.list_armed_kills().unwrap();
-        let actions = plan(now(), &repo_instances, &all_live, &armed, &[]);
+        let actions = plan(now(), &repo_instances, &all_live, &armed, &[], &[]);
         assert_eq!(actions.len(), 2, "{actions:?}");
 
         execute(&mut cloud, &client, &repo, &actions).unwrap();
@@ -427,7 +481,7 @@ mod tests {
         let repo_instances = cloud.list_tagged(&repo).unwrap();
         let all_live = cloud.list_all_tagged().unwrap();
         let armed = cloud.list_armed_kills().unwrap();
-        let replanned = plan(now(), &repo_instances, &all_live, &armed, &[]);
+        let replanned = plan(now(), &repo_instances, &all_live, &armed, &[], &[]);
         assert!(replanned.is_empty(), "{replanned:?}");
     }
 }

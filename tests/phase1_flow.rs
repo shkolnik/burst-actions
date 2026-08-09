@@ -30,12 +30,13 @@ fn abandoned_run_is_adopted_and_reconciled() {
     {
         let _lock = rs.lock().unwrap();
         rs.write(&StateFile {
-            version: 1,
+            version: burst::state::STATE_VERSION,
             repo: repo.to_string(),
             instances: launched
                 .iter()
                 .map(|i| InstanceRecord {
                     id: i.id.clone(),
+                    runner: None,
                     launched_at: Utc::now(),
                     expires_at: Utc::now() + Duration::hours(6),
                 })
@@ -73,7 +74,7 @@ fn abandoned_run_is_adopted_and_reconciled() {
 
     // The reconciled manifest is written back atomically.
     rs.write(&StateFile {
-        version: 1,
+        version: burst::state::STATE_VERSION,
         repo: repo.to_string(),
         instances: r.live,
     })
