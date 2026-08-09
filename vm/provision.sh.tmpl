@@ -15,7 +15,7 @@ apt-get install -y \
     libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2t64
 
 # rustup for the ubuntu user (build tooling available to jobs that need it).
-sudo -u ubuntu -H sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+sudo -u ubuntu -H sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
 
 # GitHub Actions runner, pinned to the version resolved at bake time.
 mkdir -p /opt/actions-runner
