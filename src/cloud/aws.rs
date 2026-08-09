@@ -711,6 +711,33 @@ fn is_burst_tagged(tags: &[aws_sdk_ec2::types::Tag]) -> bool {
         .any(|t| t.key() == Some(TAG_BURST) && t.value() == Some("1"))
 }
 
+/// Compose the error to surface when a builder must be cleaned up after some
+/// prior step failed and there is no kill schedule to fall back on:
+/// `terminate_result` is the best-effort tag-verified terminate attempted in
+/// response. Fail-loud, truthful residue messaging — if termination itself
+/// failed, the message says so plainly and names the instance rather than
+/// implying a cleanup that didn't happen.
+fn builder_cleanup_error(
+    terminate_result: Result<(), Error>,
+    builder_id: &str,
+    original: Error,
+) -> Error {
+    match terminate_result {
+        Ok(()) => Error::Aws {
+            op: "bake",
+            message: format!(
+                "arm_kill failed for builder {builder_id}; builder was terminated ({original})"
+            ),
+        },
+        Err(terminate_err) => Error::Aws {
+            op: "bake",
+            message: format!(
+                "arm_kill failed for builder {builder_id} ({original}); termination attempt also failed — builder {builder_id} may still be running: {terminate_err}"
+            ),
+        },
+    }
+}
+
 /// Select the superseded generation: every image whose `burst-actions-image-key`
 /// tag doesn't match `keep_key`, including images with no readable key tag at
 /// all — a tag-verified burst image without a key is stale by definition,
@@ -1060,8 +1087,17 @@ impl Cloud for AwsCloud {
         let expires = Utc::now() + chrono::Duration::hours(BUILDER_TTL_HOURS);
         let builder_id = self.launch_builder(expires)?;
         // Kill-armed before any waiting begins: a SIGKILLed CLI leaks only a
-        // schedule-reaped builder, never a runaway one.
-        self.arm_kill(&builder_id, expires)?;
+        // schedule-reaped builder, never a runaway one. If arming itself
+        // fails, there is no schedule to fall back on — terminate the
+        // builder right here (best-effort, tag-verified) rather than
+        // leaving an unfenced instance behind.
+        if let Err(arm_err) = self.arm_kill(&builder_id, expires) {
+            return Err(builder_cleanup_error(
+                self.terminate(std::slice::from_ref(&builder_id)),
+                &builder_id,
+                arm_err,
+            ));
+        }
 
         self.wait_for_stopped(&builder_id)?;
 
@@ -1679,6 +1715,50 @@ mod tests {
     fn instance_state_mapping_errors_on_unrecognized_name() {
         let weird = aws_sdk_ec2::types::InstanceStateName::from("weird");
         assert!(matches!(map_instance_state(&weird), Err(Error::Aws { .. })));
+    }
+
+    #[test]
+    fn builder_cleanup_error_names_instance_when_terminate_succeeds() {
+        let err = builder_cleanup_error(
+            Ok(()),
+            "i-0abc",
+            Error::Aws {
+                op: "CreateSchedule",
+                message: "scheduler role propagation did not settle".into(),
+            },
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("i-0abc"), "{msg}");
+        assert!(msg.contains("terminated"), "{msg}");
+        assert!(
+            msg.contains("scheduler role propagation did not settle"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn builder_cleanup_error_admits_builder_may_still_be_running() {
+        let err = builder_cleanup_error(
+            Err(Error::Aws {
+                op: "TerminateInstances",
+                message: "throttled".into(),
+            }),
+            "i-0abc",
+            Error::Aws {
+                op: "CreateSchedule",
+                message: "scheduler role propagation did not settle".into(),
+            },
+        );
+        let msg = err.to_string();
+        // Fail-loud, truthful residue: must name the instance and admit it
+        // may still be running, never imply cleanup succeeded.
+        assert!(msg.contains("i-0abc"), "{msg}");
+        assert!(msg.contains("may still be running"), "{msg}");
+        assert!(msg.contains("throttled"), "{msg}");
+        assert!(
+            msg.contains("scheduler role propagation did not settle"),
+            "{msg}"
+        );
     }
 
     #[test]
