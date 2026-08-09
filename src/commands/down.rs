@@ -72,21 +72,10 @@ pub fn run(config: &Config, yes: bool) -> Result<(), Error> {
 
     teardown(&mut cloud, &ids)?;
 
-    match github::token_from_env().and_then(|token| {
-        let client = github::Client::new(token);
-        let runners = client.list_runners(&config.repo)?;
-        for r in github::dead_registrations(&runners) {
-            client.delete_runner(&config.repo, r.id, &r.name)?;
-        }
-        Ok(())
-    }) {
-        Ok(()) => {}
-        Err(e) => {
-            eprintln!(
-                "warning: GitHub registration tidy failed (instances are already down; next sweep retries): {e}"
-            );
-        }
-    }
+    super::sweep::tidy_dead_registrations(
+        github::token_from_env().map(github::Client::new),
+        &config.repo,
+    );
 
     let repo_state = RepoState::open(&config.repo)?;
     match repo_state.lock() {
