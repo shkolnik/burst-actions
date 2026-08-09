@@ -139,10 +139,15 @@ resources.
       "Action": [
         "scheduler:CreateSchedule",
         "scheduler:GetSchedule",
-        "scheduler:DeleteSchedule",
-        "scheduler:ListSchedules"
+        "scheduler:DeleteSchedule"
       ],
       "Resource": "arn:aws:scheduler:*:*:schedule/default/burst-actions-*"
+    },
+    {
+      "Sid": "ListKillSchedules",
+      "Effect": "Allow",
+      "Action": "scheduler:ListSchedules",
+      "Resource": "*"
     },
     {
       "Sid": "SubstrateRoles",
@@ -200,6 +205,7 @@ What each statement serves:
 | Bake\* / DeleteSupersededImage | `burst bake` and one-generation image GC |
 | CreateZeroInboundSecurityGroup | `ensure_substrate()` (a new SG is zero-inbound by default; no rule-editing permission needed) |
 | OneShotKillSchedules | cleanup layer 1 |
+| ListKillSchedules | sweep's orphan-schedule scan — split out because AWS evaluates `ListSchedules` against `schedule/*/*`, never a name-prefixed ARN (live-verified: prefix-scoped grant is denied) |
 | SubstrateRoles / PassOurRoles | `ensure_substrate()`: the near-empty instance-profile role (trust: ec2) and the Scheduler execution role (trust: scheduler; policy: `TerminateInstances` where `burst-actions=1`) |
 | QuotaCheck | the vCPU-quota warning |
 | OptInBudgetAlarm | cleanup layer 5 (opt-in; omit this statement if declining the alarm) |
