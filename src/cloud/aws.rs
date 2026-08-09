@@ -1158,6 +1158,15 @@ impl AwsCloud {
                         .values(key)
                         .build(),
                 )
+                // Repo-scoped like cleanup_superseded: without this, repo A
+                // could cache-hit repo B's AMI — which B's next rebake then
+                // deletes out from under A.
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name(format!("tag:{TAG_REPO}"))
+                        .values(self.repo.to_string())
+                        .build(),
+                )
                 .filters(
                     aws_sdk_ec2::types::Filter::builder()
                         .name("state")
@@ -1191,7 +1200,7 @@ impl AwsCloud {
         let instance_tags = tag_specification(aws_sdk_ec2::types::ResourceType::Instance, &tags);
         let volume_tags = tag_specification(aws_sdk_ec2::types::ResourceType::Volume, &tags);
 
-        let wrapped = crate::payload::wrap_provision_for_bake(&self.provisioning_script);
+        let wrapped = crate::payload::wrap_provision_for_bake(&self.provisioning_script)?;
         let user_data_b64 = base64::engine::general_purpose::STANDARD.encode(wrapped.as_bytes());
 
         self.ctx.runtime.block_on(async {

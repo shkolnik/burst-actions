@@ -77,8 +77,20 @@ fn render_provision_from(
 /// failure leaves the instance running with no marker and no poweroff — the
 /// builder has no SSM access, so the CLI's own bake timeout (not a remote
 /// inspection) is what catches a stuck build.
-pub fn wrap_provision_for_bake(provisioning_script: &str) -> String {
-    format!(
+pub fn wrap_provision_for_bake(provisioning_script: &str) -> Result<String, Error> {
+    // The script is our own rendered template, but it is embedded in a
+    // heredoc all the same: a line colliding with the terminator would
+    // truncate it silently and execute the remainder as root shell.
+    if provisioning_script
+        .lines()
+        .any(|l| l.trim() == "BURST_PROVISION_SCRIPT")
+    {
+        return Err(Error::Environment {
+            reason: "provisioning script contains the heredoc terminator BURST_PROVISION_SCRIPT"
+                .to_string(),
+        });
+    }
+    Ok(format!(
         "#!/usr/bin/env bash\n\
          set -uo pipefail\n\
          install -d -m 0755 /var/lib/burst\n\
@@ -88,7 +100,7 @@ pub fn wrap_provision_for_bake(provisioning_script: &str) -> String {
          if /var/lib/burst/provision.sh; then\n\
          \x20   touch /var/lib/burst/provisioned && poweroff\n\
          fi\n"
-    )
+    ))
 }
 
 /// Per-VM launch user-data: writes the single-use JIT config and starts the
@@ -96,8 +108,22 @@ pub fn wrap_provision_for_bake(provisioning_script: &str) -> String {
 /// time and arm on every boot independent of this user-data ever running —
 /// if it's absent or broken, the bootstrap deadline still powers the
 /// instance off.
-pub fn fleet_user_data(jit_config: &str) -> String {
-    format!(
+pub fn fleet_user_data(jit_config: &str) -> Result<String, Error> {
+    // The blob is embedded verbatim inside a root-executed heredoc. GitHub's
+    // encoded JIT config is base64; anything outside that charset (in
+    // particular a newline, which could smuggle a heredoc terminator plus
+    // arbitrary shell) is rejected rather than embedded.
+    if jit_config.is_empty()
+        || !jit_config
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'+' || b == b'/' || b == b'=')
+    {
+        return Err(Error::Environment {
+            reason: "JIT config is not a base64 blob — refusing to embed it in launch user-data"
+                .to_string(),
+        });
+    }
+    Ok(format!(
         "#!/usr/bin/env bash\n\
          set -euo pipefail\n\
          install -d -m 0755 /etc/burst\n\
@@ -105,7 +131,7 @@ pub fn fleet_user_data(jit_config: &str) -> String {
          {jit_config}\n\
          BURST_JITCONFIG\n\
          systemctl start burst-runner.service\n"
-    )
+    ))
 }
 
 #[cfg(test)]
@@ -137,7 +163,7 @@ mod tests {
 
     #[test]
     fn bake_wrapper_powers_off_only_on_success() {
-        let wrapped = wrap_provision_for_bake("echo hi\n");
+        let wrapped = wrap_provision_for_bake("echo hi\n").unwrap();
         assert!(
             wrapped.contains("touch /var/lib/burst/provisioned && poweroff"),
             "{wrapped}"
@@ -152,14 +178,30 @@ mod tests {
     }
 
     #[test]
+    fn fleet_user_data_rejects_non_base64_blobs() {
+        // A newline is the escape vector: it could smuggle the heredoc
+        // terminator plus arbitrary root shell.
+        for bad in ["evil\nBURST_JITCONFIG\npoweroff", "", "spaces in blob"] {
+            let msg = fleet_user_data(bad).unwrap_err().to_string();
+            assert!(msg.contains("not a base64 blob"), "{bad:?}: {msg}");
+        }
+    }
+
+    #[test]
+    fn bake_wrapper_rejects_terminator_collision() {
+        let err = wrap_provision_for_bake("echo hi\nBURST_PROVISION_SCRIPT\n").unwrap_err();
+        assert!(err.to_string().contains("BURST_PROVISION_SCRIPT"));
+    }
+
+    #[test]
     fn bake_wrapper_embeds_the_provisioning_script() {
-        let wrapped = wrap_provision_for_bake("apt-get install -y foo\n");
+        let wrapped = wrap_provision_for_bake("apt-get install -y foo\n").unwrap();
         assert!(wrapped.contains("apt-get install -y foo"));
     }
 
     #[test]
     fn fleet_user_data_contains_jitconfig_mode_and_start() {
-        let ud = fleet_user_data("blob");
+        let ud = fleet_user_data("blob").unwrap();
         assert!(ud.contains("blob"));
         assert!(ud.contains("0600"));
         assert!(ud.contains("systemctl start burst-runner.service"));

@@ -12,7 +12,13 @@ fn main() {
         .expect("usage: probe_userdata <config-dir> <script-file> <cap-min>");
     let script_file = args.next().expect("script file");
     let cap_min: i64 = args.next().expect("cap minutes").parse().unwrap();
-    let user_data = std::fs::read_to_string(&script_file).expect("read script");
+    let raw = std::fs::read_to_string(&script_file).expect("read script");
+    let image_override = args.next();
+    let user_data = if script_file.ends_with(".blob") {
+        burst::payload::fleet_user_data(raw.trim_end()).expect("valid jit blob")
+    } else {
+        raw
+    };
 
     let config = burst::config::load(std::path::Path::new(&dir), None).expect("config");
     let ctx = burst::cloud::aws::AwsContext::connect(config.region.as_deref()).expect("connect");
@@ -30,7 +36,7 @@ fn main() {
     };
     let spec = burst::cloud::LaunchSpec {
         count: 1,
-        image_id: config.base_ami.clone().expect("base_ami"),
+        image_id: image_override.unwrap_or_else(|| config.base_ami.clone().expect("base_ami")),
         instance_type: config.instance_type.clone(),
         spot: false,
         tags: burst::schema::TagSpec {
