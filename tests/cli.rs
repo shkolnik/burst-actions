@@ -8,6 +8,10 @@ static SCRATCH: LazyLock<TempDir> = LazyLock::new(|| tempfile::tempdir().unwrap(
 fn burst() -> Command {
     let mut cmd = Command::cargo_bin("burst").unwrap();
     cmd.current_dir(SCRATCH.path());
+    // Commands that open the repo statefile (sweep, up, down) do so before
+    // their credential checks fail — without this redirect they'd leave a
+    // lock file for octo/widgets in the user's real state dir.
+    cmd.env("XDG_STATE_HOME", SCRATCH.path());
     cmd
 }
 
@@ -37,14 +41,89 @@ fn up_n_and_auto_conflict() {
 }
 
 #[test]
-fn subcommands_fail_loud_not_silent() {
-    for cmd in ["status", "sweep"] {
-        burst()
-            .args([cmd, "--repo", "octo/widgets"])
-            .assert()
-            .code(1)
-            .stderr(predicate::str::contains("not implemented yet"));
-    }
+fn down_fails_loud_offline_not_silently() {
+    // Like status, down's first step is a bare AWS list — no GitHub call
+    // yet — so (as in status_fails_loud_offline_not_silently) only killing
+    // every region source forces a fast, local, no-real-AWS-touched
+    // failure; this host's ~/.aws/credentials would otherwise resolve real
+    // credentials and down would truthfully report an empty fleet instead
+    // of failing.
+    burst()
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env("AWS_CONFIG_FILE", "/nonexistent/config")
+        .env("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/credentials")
+        .args(["down", "--repo", "octo/widgets"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("error:"));
+}
+
+#[test]
+fn up_fails_loud_offline_not_silently() {
+    // up's first network step is prepare()'s GitHub call, so removing the
+    // token is enough; the AWS sources are stripped too so no path through
+    // this test can touch a real account.
+    burst()
+        .env_remove("BURST_GITHUB_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env("AWS_CONFIG_FILE", "/nonexistent/config")
+        .env("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/credentials")
+        .args(["up", "1", "--repo", "octo/widgets"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("error:"));
+}
+
+#[test]
+fn status_fails_loud_offline_not_silently() {
+    // Status never calls GitHub, so (unlike bake/sweep) env_remove-ing
+    // GitHub credentials can't force an early, network-free failure — and
+    // this host's ~/.aws/credentials carries real AWS keys, so merely
+    // removing the AWS_* env vars still resolves credentials via that file.
+    // Point the SDK's config/credentials files at nowhere and strip every
+    // region source instead: region resolution fails locally, before any
+    // network call, giving a fast, no-real-AWS-touched, fail-loud check.
+    burst()
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env("AWS_CONFIG_FILE", "/nonexistent/config")
+        .env("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/credentials")
+        .args(["status", "--repo", "octo/widgets"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("error:"));
+}
+
+#[test]
+fn sweep_fails_loud_offline_not_silently() {
+    // No credentials, no GitHub token: sweep now does real work instead of
+    // `not_implemented`, but must still fail loud — exit 1, a clear
+    // stderr reason — rather than silently doing nothing.
+    burst()
+        .env_remove("BURST_GITHUB_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .args(["sweep", "--repo", "octo/widgets"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("error:"));
 }
 
 #[test]

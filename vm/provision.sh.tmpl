@@ -2,8 +2,10 @@
 # Bake-time provisioning script — runs once on the builder instance, then the
 # instance is stopped and snapshotted into the AMI. Rendered by
 # payload::render_provision(); the rendered bytes are the provisioning_script
-# image-key input, so any change here (or to a substituted timeout) forces a
-# rebake rather than silently drifting from the running AMI.
+# image-key input, so any change here forces a rebake rather than silently
+# drifting from the running AMI. Timeouts are deliberately NOT baked in —
+# they arrive per-launch via /etc/burst/launch.env, so tuning them never
+# forces a rebake.
 set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
@@ -58,6 +60,10 @@ mkdir -p /etc/burst /opt/burst /run/burst
 install -m 0755 -o root -g root /dev/stdin /opt/burst/burst-runner.sh <<'BURST_RUNNER_SH'
 __BURST_RUNNER_SH__
 BURST_RUNNER_SH
+
+install -m 0755 -o root -g root /dev/stdin /opt/burst/burst-ttl-check.sh <<'BURST_TTL_CHECK_SH'
+__BURST_TTL_CHECK_SH__
+BURST_TTL_CHECK_SH
 
 install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/burst-runner.service <<'BURST_RUNNER_SERVICE'
 __BURST_RUNNER_SERVICE__

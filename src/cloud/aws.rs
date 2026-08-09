@@ -56,6 +56,7 @@ pub struct AwsContext {
     iam: aws_sdk_iam::Client,
     budgets: aws_sdk_budgets::Client,
     sts: aws_sdk_sts::Client,
+    servicequotas: aws_sdk_servicequotas::Client,
 }
 
 /// The substrate `ensure_substrate` produces: the roles, security group, and
@@ -152,6 +153,7 @@ impl AwsContext {
         let iam = aws_sdk_iam::Client::new(&sdk_config);
         let budgets = aws_sdk_budgets::Client::new(&sdk_config);
         let sts = aws_sdk_sts::Client::new(&sdk_config);
+        let servicequotas = aws_sdk_servicequotas::Client::new(&sdk_config);
 
         Ok(AwsContext {
             runtime,
@@ -160,6 +162,7 @@ impl AwsContext {
             iam,
             budgets,
             sts,
+            servicequotas,
         })
     }
 
@@ -228,10 +231,12 @@ impl AwsContext {
                 .collect();
             by_az.sort_by_key(|(az, _)| az.to_string());
 
-            let subnet_id = by_az
-                .first()
-                .map(|(_, id)| id.to_string())
-                .ok_or(Error::NoDefaultVpc { region })?;
+            let subnet_id = by_az.first().map(|(_, id)| id.to_string()).ok_or_else(|| {
+                Error::NoDefaultSubnet {
+                    region,
+                    vpc_id: vpc_id.clone(),
+                }
+            })?;
 
             Ok((vpc_id, subnet_id))
         })
@@ -604,18 +609,20 @@ impl AwsContext {
                     message: format_aws_error(&e),
                 })?;
 
-            let mut images: Vec<(&str, &str)> = out
+            let images: Vec<(String, String, String)> = out
                 .images()
                 .iter()
-                .filter_map(|i| Some((i.image_id()?, i.creation_date()?)))
+                .filter_map(|i| {
+                    Some((
+                        i.image_id()?.to_string(),
+                        i.creation_date()?.to_string(),
+                        i.name().unwrap_or_default().to_string(),
+                    ))
+                })
                 .collect();
-            // Newest first: creation_date is ISO8601, so lexicographic order
-            // is chronological order.
-            images.sort_by(|a, b| b.1.cmp(a.1));
 
-            images
-                .first()
-                .map(|(id, _)| id.to_string())
+            pick_latest_debian(&images)
+                .cloned()
                 .ok_or_else(|| Error::Aws {
                     op: "DescribeImages(debian)",
                     message: format!(
@@ -624,6 +631,114 @@ impl AwsContext {
                 })
         })
     }
+
+    /// vCPU headroom under the account's on-demand (L-1216C47A, "Running
+    /// On-Demand Standard instances") or spot (L-34B43A08, "All Standard Spot
+    /// Instance Requests") vCPU quota: quota value minus the vCPUs of
+    /// currently running instances (DescribeInstances, running, summed
+    /// CpuOptions core_count * threads_per_core). Quota codes are cached
+    /// external facts — verified at the gate. A failure here (e.g.
+    /// AccessDenied on `servicequotas:GetServiceQuota`) is a hard
+    /// `Error::Aws` naming the missing permission — the advisory check never
+    /// silently skips (decision 9).
+    pub fn vcpu_headroom(&self, spot: bool) -> Result<u32, Error> {
+        let quota_code = if spot { "L-34B43A08" } else { "L-1216C47A" };
+
+        self.runtime.block_on(async {
+            let quota = self
+                .servicequotas
+                .get_service_quota()
+                .service_code("ec2")
+                .quota_code(quota_code)
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "GetServiceQuota",
+                    message: format!(
+                        "{} (requires servicequotas:GetServiceQuota)",
+                        format_aws_error(&e)
+                    ),
+                })?
+                .quota()
+                .and_then(|q| q.value())
+                .ok_or_else(|| Error::Aws {
+                    op: "GetServiceQuota",
+                    message: "response had no quota value".to_string(),
+                })?;
+
+            let running = self
+                .ec2
+                .describe_instances()
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name("instance-state-name")
+                        .values("running")
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "DescribeInstances(quota headroom)",
+                    message: format_aws_error(&e),
+                })?;
+
+            let used: u32 = running
+                .reservations()
+                .iter()
+                .flat_map(|r| r.instances())
+                .filter_map(|i| {
+                    let cpu = i.cpu_options()?;
+                    let cores = cpu.core_count()?;
+                    let threads = cpu.threads_per_core()?;
+                    Some((cores * threads).max(0) as u32)
+                })
+                .sum();
+
+            Ok((quota as u32).saturating_sub(used))
+        })
+    }
+
+    /// vCPUs of one instance of `instance_type`, via DescribeInstanceTypes.
+    pub fn vcpus_of(&self, instance_type: &str) -> Result<u32, Error> {
+        self.runtime.block_on(async {
+            let out = self
+                .ec2
+                .describe_instance_types()
+                .instance_types(aws_sdk_ec2::types::InstanceType::from(instance_type))
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "DescribeInstanceTypes",
+                    message: format!(
+                        "{} (requires ec2:DescribeInstanceTypes)",
+                        format_aws_error(&e)
+                    ),
+                })?;
+
+            out.instance_types()
+                .first()
+                .and_then(|t| t.v_cpu_info())
+                .and_then(|v| v.default_v_cpus())
+                .map(|n| n as u32)
+                .ok_or_else(|| Error::Aws {
+                    op: "DescribeInstanceTypes",
+                    message: format!("no vCPU info returned for instance type {instance_type}"),
+                })
+        })
+    }
+}
+
+/// Pick the newest official (non-daily) image: excludes any name containing
+/// "daily", then newest creation date (ISO8601, so lexicographic order is
+/// chronological).
+pub(crate) fn pick_latest_debian(
+    images: &[(String, String, String)], // (image_id, creation_date, name)
+) -> Option<&String> {
+    images
+        .iter()
+        .filter(|(_, _, name)| !name.contains("daily"))
+        .max_by(|a, b| a.1.cmp(&b.1))
+        .map(|(id, _, _)| id)
 }
 
 /// True for the transient invalid-instance-profile error RunInstances returns
@@ -637,6 +752,15 @@ pub(crate) fn is_iam_propagation_error(code: &str, message: &str) -> bool {
 /// Schedule name for an instance's one-shot kill: burst-actions-<instance-id>.
 pub(crate) fn kill_schedule_name(instance_id: &str) -> String {
     format!("burst-actions-{instance_id}")
+}
+
+/// Inverse of kill_schedule_name: burst-actions-i-0abc -> i-0abc. None for
+/// any name not carrying the burst-actions- prefix + an i- instance id —
+/// never guess about foreign schedules.
+pub(crate) fn instance_id_from_schedule_name(name: &str) -> Option<String> {
+    name.strip_prefix("burst-actions-")
+        .filter(|rest| rest.starts_with("i-"))
+        .map(str::to_string)
 }
 
 /// EventBridge Scheduler one-shot expression: at(yyyy-mm-ddThh:mm:ss), UTC, no zone suffix.
@@ -819,6 +943,9 @@ impl Cloud for AwsCloud {
                     .tag_specifications(volume_tags.clone());
                 if let Some(m) = market_options.clone() {
                     request = request.instance_market_options(m);
+                }
+                if let Some(k) = &spec.ssh_key {
+                    request = request.key_name(k);
                 }
 
                 match request.send().await {
@@ -1085,8 +1212,10 @@ impl Cloud for AwsCloud {
             return Ok(id);
         }
 
+        println!("bake: no cached image for {key} — building (~10 min)");
         let expires = Utc::now() + chrono::Duration::hours(BUILDER_TTL_HOURS);
         let builder_id = self.launch_builder(expires)?;
+        println!("bake: builder {builder_id} launched");
         // Kill-armed before any waiting begins: a SIGKILLed CLI leaks only a
         // schedule-reaped builder, never a runaway one. If arming itself
         // fails, there is no schedule to fall back on — terminate the
@@ -1108,20 +1237,163 @@ impl Cloud for AwsCloud {
         let image_id = match self.build_image_from_builder(&builder_id, key) {
             Ok(id) => id,
             Err(err) => {
-                return Err(builder_cleanup_error(
-                    self.terminate(std::slice::from_ref(&builder_id)),
-                    &builder_id,
-                    err,
-                ));
+                let terminate_result = self.terminate(std::slice::from_ref(&builder_id));
+                // Best-effort: if terminate itself failed, there's nothing
+                // to disarm yet (the schedule is the backstop); only clean
+                // up the schedule once the builder is actually gone.
+                if terminate_result.is_ok() {
+                    let _ = self.disarm_kill(&builder_id);
+                }
+                return Err(builder_cleanup_error(terminate_result, &builder_id, err));
             }
         };
 
         self.terminate(std::slice::from_ref(&builder_id))?;
-        self.delete_kill_schedule(&builder_id)?;
+        self.disarm_kill(&builder_id)?;
 
         self.cleanup_superseded(key)?;
 
         Ok(image_id)
+    }
+
+    /// Best-effort-but-checked delete of an instance's kill schedule: already
+    /// gone (fired, or never armed) is not an error.
+    fn disarm_kill(&mut self, instance_id: &str) -> Result<(), Error> {
+        self.ctx.runtime.block_on(async {
+            match self
+                .ctx
+                .scheduler
+                .delete_schedule()
+                .name(kill_schedule_name(instance_id))
+                .group_name("default")
+                .send()
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(e)
+                    if e.as_service_error()
+                        .is_some_and(|s| s.is_resource_not_found_exception()) =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(Error::Aws {
+                    op: "DeleteSchedule",
+                    message: format_aws_error(&e),
+                }),
+            }
+        })
+    }
+
+    /// `ListSchedules` under group `default` filtered by our
+    /// `burst-actions-i-` prefix, paginated to exhaustion, mapped through
+    /// the pure inverse of `kill_schedule_name`.
+    fn list_armed_kills(&self) -> Result<Vec<String>, Error> {
+        self.ctx.runtime.block_on(async {
+            let mut out = Vec::new();
+            let mut next_token: Option<String> = None;
+            loop {
+                let mut request = self
+                    .ctx
+                    .scheduler
+                    .list_schedules()
+                    .group_name("default")
+                    .name_prefix("burst-actions-i-");
+                if let Some(token) = &next_token {
+                    request = request.next_token(token);
+                }
+
+                let output = request.send().await.map_err(|e| Error::Aws {
+                    op: "ListSchedules",
+                    message: format_aws_error(&e),
+                })?;
+
+                for schedule in output.schedules() {
+                    if let Some(name) = schedule.name()
+                        && let Some(id) = instance_id_from_schedule_name(name)
+                    {
+                        out.push(id);
+                    }
+                }
+
+                next_token = output.next_token().map(str::to_string);
+                if next_token.is_none() {
+                    break;
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Same `DescribeInstances` as `list_tagged` minus the
+    /// `tag:burst-actions-repo` filter — all repos, still tag-fenced.
+    fn list_all_tagged(&self) -> Result<Vec<Instance>, Error> {
+        self.ctx.runtime.block_on(async {
+            let mut out = Vec::new();
+            let mut next_token: Option<String> = None;
+            loop {
+                let mut request = self
+                    .ctx
+                    .ec2
+                    .describe_instances()
+                    .filters(
+                        aws_sdk_ec2::types::Filter::builder()
+                            .name(format!("tag:{TAG_BURST}"))
+                            .values("1")
+                            .build(),
+                    )
+                    .filters(
+                        aws_sdk_ec2::types::Filter::builder()
+                            .name("instance-state-name")
+                            .values("pending")
+                            .values("running")
+                            .values("shutting-down")
+                            .values("stopping")
+                            .values("stopped")
+                            .build(),
+                    );
+                if let Some(token) = &next_token {
+                    request = request.next_token(token);
+                }
+
+                let output = request.send().await.map_err(|e| Error::Aws {
+                    op: "DescribeInstances",
+                    message: format_aws_error(&e),
+                })?;
+
+                for reservation in output.reservations() {
+                    for instance in reservation.instances() {
+                        let id = instance.instance_id().ok_or_else(|| Error::Aws {
+                            op: "DescribeInstances",
+                            message: "response instance had no id".to_string(),
+                        })?;
+                        let state_name =
+                            instance
+                                .state()
+                                .and_then(|s| s.name())
+                                .ok_or_else(|| Error::Aws {
+                                    op: "DescribeInstances",
+                                    message: format!("instance {id} had no state"),
+                                })?;
+                        let tags = instance
+                            .tags()
+                            .iter()
+                            .filter_map(|t| Some((t.key()?.to_string(), t.value()?.to_string())))
+                            .collect();
+                        out.push(Instance {
+                            id: id.to_string(),
+                            state: map_instance_state(state_name)?,
+                            tags,
+                        });
+                    }
+                }
+
+                next_token = output.next_token().map(str::to_string);
+                if next_token.is_none() {
+                    break;
+                }
+            }
+            Ok(out)
+        })
     }
 }
 
@@ -1130,9 +1402,15 @@ impl AwsCloud {
     /// usable AMI, factored out so `bake` can clean up the builder on any
     /// error in it.
     fn build_image_from_builder(&mut self, builder_id: &str, key: &str) -> Result<String, Error> {
-        self.wait_for_stopped(builder_id)?;
+        print!("bake: provisioning");
+        let provision_result = self.wait_for_stopped(builder_id);
+        println!();
+        provision_result?;
         let image_id = self.create_image(builder_id, key)?;
-        self.wait_for_image_available(&image_id)?;
+        print!("bake: imaging {image_id}");
+        let image_result = self.wait_for_image_available(&image_id);
+        println!();
+        image_result?;
         Ok(image_id)
     }
 
@@ -1277,23 +1555,24 @@ impl AwsCloud {
     }
 
     /// Poll until the builder reaches `Stopped` (provisioning succeeded, or
-    /// the bootstrap-deadline timer powered it off on failure). Past the
-    /// deadline: terminate (tag-verified) and delete the kill schedule
-    /// first — exactly what the timeout error promises — then fail loud.
-    fn wait_for_stopped(&mut self, builder_id: &str) -> Result<(), Error> {
+    /// the bootstrap-deadline timer powered it off on failure). Observes
+    /// only — never terminates or disarms; `bake`'s single error arm
+    /// (via `builder_cleanup_error`) is the one cleanup site for a timeout,
+    /// same as for any other failure between launch and a finished image.
+    fn wait_for_stopped(&self, builder_id: &str) -> Result<(), Error> {
         let deadline = std::time::Instant::now() + Duration::from_secs(STOP_TIMEOUT_MINUTES * 60);
         loop {
             if self.describe_instance_state(builder_id)? == InstanceState::Stopped {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                self.terminate(&[builder_id.to_string()])?;
-                self.delete_kill_schedule(builder_id)?;
                 return Err(Error::BakeTimeout {
                     instance_id: builder_id.to_string(),
                     minutes: STOP_TIMEOUT_MINUTES,
                 });
             }
+            print!(".");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
             std::thread::sleep(STOP_POLL_INTERVAL);
         }
     }
@@ -1383,36 +1662,10 @@ impl AwsCloud {
                     ),
                 });
             }
+            print!(".");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
             std::thread::sleep(IMAGE_POLL_INTERVAL);
         }
-    }
-
-    /// Best-effort-but-checked delete of a builder's kill schedule: already
-    /// gone (fired, or never armed) is not an error.
-    fn delete_kill_schedule(&self, instance_id: &str) -> Result<(), Error> {
-        self.ctx.runtime.block_on(async {
-            match self
-                .ctx
-                .scheduler
-                .delete_schedule()
-                .name(kill_schedule_name(instance_id))
-                .group_name("default")
-                .send()
-                .await
-            {
-                Ok(_) => Ok(()),
-                Err(e)
-                    if e.as_service_error()
-                        .is_some_and(|s| s.is_resource_not_found_exception()) =>
-                {
-                    Ok(())
-                }
-                Err(e) => Err(Error::Aws {
-                    op: "DeleteSchedule",
-                    message: format_aws_error(&e),
-                }),
-            }
-        })
     }
 
     /// All available images we own, tagged `burst-actions=1` for this repo —
@@ -1827,6 +2080,74 @@ mod tests {
         assert!(is_burst_tagged(&tagged));
         let untagged: [aws_sdk_ec2::types::Tag; 0] = [];
         assert!(!is_burst_tagged(&untagged));
+    }
+
+    #[test]
+    fn instance_id_from_schedule_name_round_trips() {
+        assert_eq!(
+            instance_id_from_schedule_name(&kill_schedule_name("i-0abc")),
+            Some("i-0abc".to_string())
+        );
+    }
+
+    #[test]
+    fn instance_id_from_schedule_name_rejects_non_instance_suffix() {
+        assert_eq!(
+            instance_id_from_schedule_name("burst-actions-somethingelse"),
+            None
+        );
+    }
+
+    #[test]
+    fn instance_id_from_schedule_name_rejects_missing_prefix() {
+        assert_eq!(instance_id_from_schedule_name("other-i-0abc"), None);
+    }
+
+    #[test]
+    fn pick_latest_debian_skips_a_newer_daily_in_favor_of_an_older_release() {
+        let images = vec![
+            (
+                "ami-release".to_string(),
+                "2026-08-01T00:00:00.000Z".to_string(),
+                "debian-13-amd64-20260801-1".to_string(),
+            ),
+            (
+                "ami-daily".to_string(),
+                "2026-08-08T00:00:00.000Z".to_string(),
+                "debian-13-amd64-daily-20260808-1".to_string(),
+            ),
+        ];
+        assert_eq!(
+            pick_latest_debian(&images),
+            Some(&"ami-release".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_latest_debian_is_none_when_only_dailies_exist() {
+        let images = vec![(
+            "ami-daily".to_string(),
+            "2026-08-08T00:00:00.000Z".to_string(),
+            "debian-13-amd64-daily-20260808-1".to_string(),
+        )];
+        assert_eq!(pick_latest_debian(&images), None);
+    }
+
+    #[test]
+    fn pick_latest_debian_picks_lexicographically_newest_date_among_releases() {
+        let images = vec![
+            (
+                "ami-old".to_string(),
+                "2026-07-01T00:00:00.000Z".to_string(),
+                "debian-13-amd64-20260701-1".to_string(),
+            ),
+            (
+                "ami-new".to_string(),
+                "2026-08-01T00:00:00.000Z".to_string(),
+                "debian-13-amd64-20260801-1".to_string(),
+            ),
+        ];
+        assert_eq!(pick_latest_debian(&images), Some(&"ami-new".to_string()));
     }
 
     #[test]

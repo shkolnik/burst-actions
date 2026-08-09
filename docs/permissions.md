@@ -28,7 +28,8 @@ resources.
         "ec2:DescribeSecurityGroups",
         "ec2:DescribeVpcs",
         "ec2:DescribeSubnets",
-        "ec2:DescribeTags"
+        "ec2:DescribeTags",
+        "ec2:DescribeInstanceTypes"
       ],
       "Resource": "*"
     },
@@ -207,7 +208,7 @@ What each statement serves:
 | OneShotKillSchedules | cleanup layer 1 |
 | ListKillSchedules | sweep's orphan-schedule scan — split out because AWS evaluates `ListSchedules` against `schedule/*/*`, never a name-prefixed ARN (live-verified: prefix-scoped grant is denied) |
 | SubstrateRoles / PassOurRoles | `ensure_substrate()`: the near-empty instance-profile role (trust: ec2) and the Scheduler execution role (trust: scheduler; policy: `TerminateInstances` where `burst-actions=1`) |
-| QuotaCheck | the vCPU-quota warning |
+| QuotaCheck / ec2:DescribeInstanceTypes | the vCPU-quota warning (decision 9) |
 | OptInBudgetAlarm | cleanup layer 5 (opt-in; omit this statement if declining the alarm) |
 
 ### Known limits, stated plainly

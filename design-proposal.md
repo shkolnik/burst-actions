@@ -321,6 +321,12 @@ All 2026-08-08, James:
     `burst-actions-expires`; AWS resource names `burst-actions-*`. The binary/crate stays
     `burst` (typed constantly; the long form earns nothing at a shell prompt), as does the
     `burst` routing label in `runs-on`.
+12. **Watch is local-manifest scoped** (2026-08-09, James): the watcher counts only instances
+    named in its own statefile, and GitHub registration tidy acts only on runner names this
+    manifest minted (recorded per instance; adopted instances carry no name and are never
+    tidied). This also dissolves the API ambiguity between a concurrent invocation's
+    still-booting JIT runner and a never-connected corpse — an unminted registration is simply
+    never ours to judge.
 
 ## 7. Rollout
 

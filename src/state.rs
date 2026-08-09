@@ -6,11 +6,17 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 
-pub const STATE_VERSION: u32 = 1;
+pub const STATE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InstanceRecord {
     pub id: String,
+    /// The runner name this manifest minted for the instance; `None` for
+    /// adopted instances (their JIT config was minted elsewhere, so the
+    /// name is unknowable here). Registration tidy acts only on `Some`
+    /// names — a registration this manifest didn't mint is never its to
+    /// judge.
+    pub runner: Option<String>,
     pub launched_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
@@ -195,10 +201,11 @@ mod tests {
 
     fn sample() -> StateFile {
         StateFile {
-            version: 1,
+            version: STATE_VERSION,
             repo: "octo/widgets".into(),
             instances: vec![InstanceRecord {
                 id: "i-0123".into(),
+                runner: Some("burst-0123abcd".into()),
                 launched_at: Utc::now(),
                 expires_at: Utc::now(),
             }],
@@ -271,7 +278,7 @@ mod tests {
         // persist a version it can't read back (see write_rejects_wrong_version).
         std::fs::write(
             d.path().join("state.json"),
-            br#"{"version":2,"repo":"octo/widgets","instances":[]}"#,
+            br#"{"version":99,"repo":"octo/widgets","instances":[]}"#,
         )
         .unwrap();
         assert!(matches!(rs.read(), Err(Error::StateCorrupt { .. })));
@@ -282,7 +289,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let rs = RepoState::open_at(d.path().to_path_buf());
         let mut s = sample();
-        s.version = 2;
+        s.version = 99;
         assert!(matches!(rs.write(&s), Err(Error::StateCorrupt { .. })));
         // Nothing should have been persisted.
         assert!(rs.read().unwrap().is_none());

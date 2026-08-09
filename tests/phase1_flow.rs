@@ -23,18 +23,20 @@ fn abandoned_run_is_adopted_and_reconciled() {
                 expires: Utc::now() + Duration::hours(6),
             },
             user_data: "jit".into(),
+            ssh_key: None,
         })
         .unwrap();
     let rs = RepoState::open_at(dir.path().to_path_buf());
     {
         let _lock = rs.lock().unwrap();
         rs.write(&StateFile {
-            version: 1,
+            version: burst::state::STATE_VERSION,
             repo: repo.to_string(),
             instances: launched
                 .iter()
                 .map(|i| InstanceRecord {
                     id: i.id.clone(),
+                    runner: None,
                     launched_at: Utc::now(),
                     expires_at: Utc::now() + Duration::hours(6),
                 })
@@ -57,6 +59,7 @@ fn abandoned_run_is_adopted_and_reconciled() {
                 expires: Utc::now() + Duration::hours(6),
             },
             user_data: "jit2".into(),
+            ssh_key: None,
         })
         .unwrap();
 
@@ -71,7 +74,7 @@ fn abandoned_run_is_adopted_and_reconciled() {
 
     // The reconciled manifest is written back atomically.
     rs.write(&StateFile {
-        version: 1,
+        version: burst::state::STATE_VERSION,
         repo: repo.to_string(),
         instances: r.live,
     })

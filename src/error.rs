@@ -51,7 +51,23 @@ pub enum Error {
     )]
     NoDefaultVpc { region: String },
     #[error(
-        "bake timed out: builder {instance_id} did not reach 'stopped' within {minutes} min — provisioning likely failed; the builder was terminated and its kill schedule deleted"
+        "bake timed out: builder {instance_id} did not reach 'stopped' within {minutes} min — provisioning likely failed"
     )]
     BakeTimeout { instance_id: String, minutes: u64 },
+    #[error(
+        "fork pull-request workflows on {repo} do not require approval for all outside collaborators ({found}); burst refuses to launch runners — a fork can edit runs-on:, so labels are not a trust boundary. Fix: repo Settings → Actions → General → Fork pull request workflows → \"Require approval for all external contributors\""
+    )]
+    ForkApprovalTooWeak { repo: String, found: String },
+    #[error(
+        "default VPC {vpc_id} in {region} has no default subnet: create one with `aws ec2 create-default-subnet --availability-zone <az> --region {region}` (repeat per AZ as needed)"
+    )]
+    NoDefaultSubnet { region: String, vpc_id: String },
+    #[error(
+        "launched {launched} of {requested} instances, then: {message} — the launched fleet is tagged, kill-armed, and recorded; it will drain and self-terminate. Re-run `burst up` to re-attach, `burst down` to tear down"
+    )]
+    PartialLaunch {
+        launched: u32,
+        requested: u32,
+        message: String,
+    },
 }

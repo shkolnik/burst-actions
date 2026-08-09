@@ -17,14 +17,16 @@ hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
 tokio = { version = "1", features = ["rt"] }
 aws-config = { version = "1", features = ["behavior-version-latest"] }
-aws-sdk-ec2 = "1"
-aws-sdk-scheduler = "1"
-aws-sdk-iam = "1"
-aws-sdk-budgets = "1"
-aws-sdk-sts = "1"
+aws-sdk-ec2 = { version = "1", default-features = false, features = ["rt-tokio"] }
+aws-sdk-scheduler = { version = "1", default-features = false, features = ["rt-tokio"] }
+aws-sdk-iam = { version = "1", default-features = false, features = ["rt-tokio"] }
+aws-sdk-budgets = { version = "1", default-features = false, features = ["rt-tokio"] }
+aws-sdk-sts = { version = "1", default-features = false, features = ["rt-tokio"] }
 aws-smithy-types = "1"
 ureq = { version = "3", features = ["json"] }
 base64 = "0.22"
+ctrlc = "3"
+aws-sdk-servicequotas = { version = "1", default-features = false, features = ["rt-tokio"] }
 
 [dev-dependencies]
 assert_cmd = "2"

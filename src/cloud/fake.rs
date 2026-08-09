@@ -80,6 +80,25 @@ impl Cloud for FakeCloud {
             .or_insert_with(|| format!("ami-fake-{key}"))
             .clone())
     }
+
+    fn disarm_kill(&mut self, instance_id: &str) -> Result<(), Error> {
+        self.kills.retain(|(id, _)| id != instance_id);
+        Ok(())
+    }
+
+    fn list_armed_kills(&self) -> Result<Vec<String>, Error> {
+        Ok(self.kills.iter().map(|(id, _)| id.clone()).collect())
+    }
+
+    fn list_all_tagged(&self) -> Result<Vec<Instance>, Error> {
+        Ok(self
+            .instances
+            .iter()
+            .filter(|i| i.state != InstanceState::Terminated)
+            .filter(|i| i.tags.iter().any(|(k, v)| k == TAG_BURST && v == "1"))
+            .cloned()
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -99,6 +118,7 @@ mod tests {
                 expires: Utc::now() + Duration::hours(6),
             },
             user_data: "jit-blob".into(),
+            ssh_key: None,
         }
     }
 
@@ -170,5 +190,45 @@ mod tests {
         let a = c.bake("v1-abc").unwrap();
         assert_eq!(a, c.bake("v1-abc").unwrap());
         assert_ne!(a, c.bake("v1-def").unwrap());
+    }
+
+    #[test]
+    fn disarm_kill_removes_only_that_schedule() {
+        let mut c = FakeCloud::default();
+        let at = Utc::now() + Duration::hours(6);
+        let launched = c.launch(&spec("octo/widgets", 2)).unwrap();
+        c.arm_kill(&launched[0].id, at).unwrap();
+        c.arm_kill(&launched[1].id, at).unwrap();
+        c.disarm_kill(&launched[0].id).unwrap();
+        assert_eq!(c.armed_kills(), &[(launched[1].id.clone(), at)]);
+    }
+
+    #[test]
+    fn disarm_kill_is_idempotent() {
+        let mut c = FakeCloud::default();
+        let at = Utc::now() + Duration::hours(6);
+        let launched = c.launch(&spec("octo/widgets", 1)).unwrap();
+        c.arm_kill(&launched[0].id, at).unwrap();
+        c.disarm_kill(&launched[0].id).unwrap();
+        c.disarm_kill(&launched[0].id).unwrap();
+        assert!(c.armed_kills().is_empty());
+    }
+
+    #[test]
+    fn list_all_tagged_spans_repos_but_requires_burst_tag() {
+        let mut c = FakeCloud::default();
+        let a = c.launch(&spec("octo/widgets", 1)).unwrap();
+        let b = c.launch(&spec("other/repo", 1)).unwrap();
+        c.plant(Instance {
+            id: "i-untagged".into(),
+            state: InstanceState::Running,
+            tags: vec![(TAG_REPO.into(), "octo/widgets".into())],
+        });
+        let all = c.list_all_tagged().unwrap();
+        let ids: Vec<&str> = all.iter().map(|i| i.id.as_str()).collect();
+        assert!(ids.contains(&a[0].id.as_str()));
+        assert!(ids.contains(&b[0].id.as_str()));
+        assert!(!ids.contains(&"i-untagged"));
+        assert_eq!(all.len(), 2);
     }
 }
