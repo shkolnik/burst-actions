@@ -232,12 +232,17 @@ offline-testable.
 
 ```json
 {"jobs": [
-  {"name": "bench (1)", "created_at": "2026-08-09T10:00:00Z",
+  {"name": "bench (1)", "conclusion": "success", "created_at": "2026-08-09T10:00:00Z",
    "started_at": "2026-08-09T10:02:00Z", "completed_at": "2026-08-09T10:12:00Z"},
-  {"name": "bench (2)", "created_at": "2026-08-09T10:00:30Z",
-   "started_at": "2026-08-09T10:03:00Z", "completed_at": "2026-08-09T10:13:30Z"}
+  {"name": "bench (2)", "conclusion": "success", "created_at": "2026-08-09T10:00:30Z",
+   "started_at": "2026-08-09T10:03:00Z", "completed_at": "2026-08-09T10:13:30Z"},
+  {"name": "serial", "conclusion": "skipped", "created_at": "2026-08-09T10:00:00Z",
+   "started_at": "2026-08-09T10:00:01Z", "completed_at": "2026-08-09T10:00:01Z"}
 ]}
 ```
+
+(The `serial` skipped entry mirrors what the live API returns for the
+mode not dispatched; the script must exclude it from every number.)
 
 - [ ] **Step 2: Write `bench/report.sh`**
 
@@ -250,6 +255,8 @@ price=${1:?usage: report.sh PRICE_PER_HOUR < jobs.json}
 jq -r --arg price "$price" '
   def t: sub("Z$"; "+00:00") | fromdate;
   .jobs
+  # the mode not dispatched still appears as a skipped job — drop it
+  | map(select(.conclusion != "skipped"))
   | map({name, c: (.created_at|t), s: (.started_at|t), e: (.completed_at|t)})
   | (map("job=\(.name) queued=\(.s - .c) run=\(.e - .s)") | .[]),
     "total wall=\((map(.e)|max) - (map(.c)|min)) busy_instance_seconds=\(map(.e - .s)|add) cost_usd=\((map(.e - .s)|add) * (($price|tonumber) / 3600) * 10000 | round / 10000)"
