@@ -60,6 +60,31 @@ fn down_fails_loud_offline_not_silently() {
 }
 
 #[test]
+fn up_fails_loud_offline_not_silently() {
+    // up's first network step is prepare()'s GitHub call, so removing the
+    // token is enough; the AWS sources are stripped too so no path through
+    // this test can touch a real account. XDG_STATE_HOME is redirected so
+    // the lock/statefile land in the scratch dir, not the user's state dir.
+    let d = tempfile::tempdir().unwrap();
+    burst()
+        .env("XDG_STATE_HOME", d.path())
+        .env_remove("BURST_GITHUB_TOKEN")
+        .env_remove("GITHUB_TOKEN")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env("AWS_CONFIG_FILE", "/nonexistent/config")
+        .env("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/credentials")
+        .args(["up", "1", "--repo", "octo/widgets"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("error:"));
+}
+
+#[test]
 fn status_fails_loud_offline_not_silently() {
     // Status never calls GitHub, so (unlike bake/sweep) env_remove-ing
     // GitHub credentials can't force an early, network-free failure — and

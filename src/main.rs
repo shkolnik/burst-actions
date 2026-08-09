@@ -49,11 +49,6 @@ enum Cmd {
     Sweep,
 }
 
-fn not_implemented(cmd: &str) -> ExitCode {
-    eprintln!("burst {cmd}: not implemented yet (see implementation-phases.md)");
-    ExitCode::FAILURE
-}
-
 fn main() -> ExitCode {
     let cli = Cli::parse();
 
@@ -73,7 +68,28 @@ fn main() -> ExitCode {
     };
 
     match cli.command {
-        Cmd::Up { .. } => not_implemented("up"),
+        Cmd::Up {
+            n,
+            auto,
+            spot,
+            yes,
+            ssh_key,
+        } => match burst::commands::up::run(
+            &config,
+            &burst::commands::up::UpArgs {
+                n,
+                auto,
+                spot,
+                yes,
+                ssh_key,
+            },
+        ) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::Bake => match burst::commands::bake::run(&config) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
