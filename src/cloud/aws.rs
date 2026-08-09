@@ -1212,8 +1212,10 @@ impl Cloud for AwsCloud {
             return Ok(id);
         }
 
+        println!("bake: no cached image for {key} — building (~10 min)");
         let expires = Utc::now() + chrono::Duration::hours(BUILDER_TTL_HOURS);
         let builder_id = self.launch_builder(expires)?;
+        println!("bake: builder {builder_id} launched");
         // Kill-armed before any waiting begins: a SIGKILLed CLI leaks only a
         // schedule-reaped builder, never a runaway one. If arming itself
         // fails, there is no schedule to fall back on — terminate the
@@ -1400,9 +1402,15 @@ impl AwsCloud {
     /// usable AMI, factored out so `bake` can clean up the builder on any
     /// error in it.
     fn build_image_from_builder(&mut self, builder_id: &str, key: &str) -> Result<String, Error> {
-        self.wait_for_stopped(builder_id)?;
+        print!("bake: provisioning");
+        let provision_result = self.wait_for_stopped(builder_id);
+        println!();
+        provision_result?;
         let image_id = self.create_image(builder_id, key)?;
-        self.wait_for_image_available(&image_id)?;
+        print!("bake: imaging {image_id}");
+        let image_result = self.wait_for_image_available(&image_id);
+        println!();
+        image_result?;
         Ok(image_id)
     }
 
@@ -1563,6 +1571,8 @@ impl AwsCloud {
                     minutes: STOP_TIMEOUT_MINUTES,
                 });
             }
+            print!(".");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
             std::thread::sleep(STOP_POLL_INTERVAL);
         }
     }
@@ -1652,6 +1662,8 @@ impl AwsCloud {
                     ),
                 });
             }
+            print!(".");
+            let _ = std::io::Write::flush(&mut std::io::stdout());
             std::thread::sleep(IMAGE_POLL_INTERVAL);
         }
     }
