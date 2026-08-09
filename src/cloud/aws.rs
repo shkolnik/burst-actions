@@ -727,13 +727,13 @@ fn builder_cleanup_error(
         Ok(()) => Error::Aws {
             op: "bake",
             message: format!(
-                "arm_kill failed for builder {builder_id}; builder was terminated ({original})"
+                "bake failed after launching builder {builder_id}; builder was terminated ({original})"
             ),
         },
         Err(terminate_err) => Error::Aws {
             op: "bake",
             message: format!(
-                "arm_kill failed for builder {builder_id} ({original}); termination attempt also failed — builder {builder_id} may still be running: {terminate_err}"
+                "bake failed after launching builder {builder_id} ({original}); termination attempt also failed — builder {builder_id} may still be running: {terminate_err}"
             ),
         },
     }
@@ -1100,10 +1100,21 @@ impl Cloud for AwsCloud {
             ));
         }
 
-        self.wait_for_stopped(&builder_id)?;
-
-        let image_id = self.create_image(&builder_id, key)?;
-        self.wait_for_image_available(&image_id)?;
+        // Any failure between launch and a finished image gets the same
+        // treatment as an arm_kill failure above: best-effort terminate the
+        // builder now rather than leaving it to idle until the schedule
+        // fires (the schedule stays armed as the backstop and self-deletes
+        // after firing on the already-dead instance).
+        let image_id = match self.build_image_from_builder(&builder_id, key) {
+            Ok(id) => id,
+            Err(err) => {
+                return Err(builder_cleanup_error(
+                    self.terminate(std::slice::from_ref(&builder_id)),
+                    &builder_id,
+                    err,
+                ));
+            }
+        };
 
         self.terminate(std::slice::from_ref(&builder_id))?;
         self.delete_kill_schedule(&builder_id)?;
@@ -1115,6 +1126,16 @@ impl Cloud for AwsCloud {
 }
 
 impl AwsCloud {
+    /// The wait → CreateImage → wait sequence between builder launch and a
+    /// usable AMI, factored out so `bake` can clean up the builder on any
+    /// error in it.
+    fn build_image_from_builder(&mut self, builder_id: &str, key: &str) -> Result<String, Error> {
+        self.wait_for_stopped(builder_id)?;
+        let image_id = self.create_image(builder_id, key)?;
+        self.wait_for_image_available(&image_id)?;
+        Ok(image_id)
+    }
+
     /// Cache check: an available AMI we own, tagged for this repo's key.
     /// Get-or-create semantics — a hit short-circuits before any builder is
     /// launched.
