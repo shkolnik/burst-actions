@@ -639,6 +639,15 @@ pub(crate) fn kill_schedule_name(instance_id: &str) -> String {
     format!("burst-actions-{instance_id}")
 }
 
+/// Inverse of kill_schedule_name: burst-actions-i-0abc -> i-0abc. None for
+/// any name not carrying the burst-actions- prefix + an i- instance id —
+/// never guess about foreign schedules.
+pub(crate) fn instance_id_from_schedule_name(name: &str) -> Option<String> {
+    name.strip_prefix("burst-actions-")
+        .filter(|rest| rest.starts_with("i-"))
+        .map(str::to_string)
+}
+
 /// EventBridge Scheduler one-shot expression: at(yyyy-mm-ddThh:mm:ss), UTC, no zone suffix.
 pub(crate) fn at_expression(at: DateTime<Utc>) -> String {
     format!("at({})", at.format("%Y-%m-%dT%H:%M:%S"))
@@ -819,6 +828,9 @@ impl Cloud for AwsCloud {
                     .tag_specifications(volume_tags.clone());
                 if let Some(m) = market_options.clone() {
                     request = request.instance_market_options(m);
+                }
+                if let Some(k) = &spec.ssh_key {
+                    request = request.key_name(k);
                 }
 
                 match request.send().await {
@@ -1117,11 +1129,151 @@ impl Cloud for AwsCloud {
         };
 
         self.terminate(std::slice::from_ref(&builder_id))?;
-        self.delete_kill_schedule(&builder_id)?;
+        self.disarm_kill(&builder_id)?;
 
         self.cleanup_superseded(key)?;
 
         Ok(image_id)
+    }
+
+    /// Best-effort-but-checked delete of a builder's kill schedule: already
+    /// gone (fired, or never armed) is not an error.
+    fn disarm_kill(&mut self, instance_id: &str) -> Result<(), Error> {
+        self.ctx.runtime.block_on(async {
+            match self
+                .ctx
+                .scheduler
+                .delete_schedule()
+                .name(kill_schedule_name(instance_id))
+                .group_name("default")
+                .send()
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(e)
+                    if e.as_service_error()
+                        .is_some_and(|s| s.is_resource_not_found_exception()) =>
+                {
+                    Ok(())
+                }
+                Err(e) => Err(Error::Aws {
+                    op: "DeleteSchedule",
+                    message: format_aws_error(&e),
+                }),
+            }
+        })
+    }
+
+    /// `ListSchedules` under group `default` filtered by our
+    /// `burst-actions-i-` prefix, paginated to exhaustion, mapped through
+    /// the pure inverse of `kill_schedule_name`.
+    fn list_armed_kills(&self) -> Result<Vec<String>, Error> {
+        self.ctx.runtime.block_on(async {
+            let mut out = Vec::new();
+            let mut next_token: Option<String> = None;
+            loop {
+                let mut request = self
+                    .ctx
+                    .scheduler
+                    .list_schedules()
+                    .group_name("default")
+                    .name_prefix("burst-actions-i-");
+                if let Some(token) = &next_token {
+                    request = request.next_token(token);
+                }
+
+                let output = request.send().await.map_err(|e| Error::Aws {
+                    op: "ListSchedules",
+                    message: format_aws_error(&e),
+                })?;
+
+                for schedule in output.schedules() {
+                    if let Some(name) = schedule.name()
+                        && let Some(id) = instance_id_from_schedule_name(name)
+                    {
+                        out.push(id);
+                    }
+                }
+
+                next_token = output.next_token().map(str::to_string);
+                if next_token.is_none() {
+                    break;
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    /// Same `DescribeInstances` as `list_tagged` minus the
+    /// `tag:burst-actions-repo` filter — all repos, still tag-fenced.
+    fn list_all_tagged(&self) -> Result<Vec<Instance>, Error> {
+        self.ctx.runtime.block_on(async {
+            let mut out = Vec::new();
+            let mut next_token: Option<String> = None;
+            loop {
+                let mut request = self
+                    .ctx
+                    .ec2
+                    .describe_instances()
+                    .filters(
+                        aws_sdk_ec2::types::Filter::builder()
+                            .name(format!("tag:{TAG_BURST}"))
+                            .values("1")
+                            .build(),
+                    )
+                    .filters(
+                        aws_sdk_ec2::types::Filter::builder()
+                            .name("instance-state-name")
+                            .values("pending")
+                            .values("running")
+                            .values("shutting-down")
+                            .values("stopping")
+                            .values("stopped")
+                            .build(),
+                    );
+                if let Some(token) = &next_token {
+                    request = request.next_token(token);
+                }
+
+                let output = request.send().await.map_err(|e| Error::Aws {
+                    op: "DescribeInstances",
+                    message: format_aws_error(&e),
+                })?;
+
+                for reservation in output.reservations() {
+                    for instance in reservation.instances() {
+                        let id = instance.instance_id().ok_or_else(|| Error::Aws {
+                            op: "DescribeInstances",
+                            message: "response instance had no id".to_string(),
+                        })?;
+                        let state_name =
+                            instance
+                                .state()
+                                .and_then(|s| s.name())
+                                .ok_or_else(|| Error::Aws {
+                                    op: "DescribeInstances",
+                                    message: format!("instance {id} had no state"),
+                                })?;
+                        let tags = instance
+                            .tags()
+                            .iter()
+                            .filter_map(|t| Some((t.key()?.to_string(), t.value()?.to_string())))
+                            .collect();
+                        out.push(Instance {
+                            id: id.to_string(),
+                            state: map_instance_state(state_name)?,
+                            tags,
+                        });
+                    }
+                }
+
+                next_token = output.next_token().map(str::to_string);
+                if next_token.is_none() {
+                    break;
+                }
+            }
+            Ok(out)
+        })
     }
 }
 
@@ -1288,7 +1440,7 @@ impl AwsCloud {
             }
             if std::time::Instant::now() >= deadline {
                 self.terminate(&[builder_id.to_string()])?;
-                self.delete_kill_schedule(builder_id)?;
+                self.disarm_kill(builder_id)?;
                 return Err(Error::BakeTimeout {
                     instance_id: builder_id.to_string(),
                     minutes: STOP_TIMEOUT_MINUTES,
@@ -1385,34 +1537,6 @@ impl AwsCloud {
             }
             std::thread::sleep(IMAGE_POLL_INTERVAL);
         }
-    }
-
-    /// Best-effort-but-checked delete of a builder's kill schedule: already
-    /// gone (fired, or never armed) is not an error.
-    fn delete_kill_schedule(&self, instance_id: &str) -> Result<(), Error> {
-        self.ctx.runtime.block_on(async {
-            match self
-                .ctx
-                .scheduler
-                .delete_schedule()
-                .name(kill_schedule_name(instance_id))
-                .group_name("default")
-                .send()
-                .await
-            {
-                Ok(_) => Ok(()),
-                Err(e)
-                    if e.as_service_error()
-                        .is_some_and(|s| s.is_resource_not_found_exception()) =>
-                {
-                    Ok(())
-                }
-                Err(e) => Err(Error::Aws {
-                    op: "DeleteSchedule",
-                    message: format_aws_error(&e),
-                }),
-            }
-        })
     }
 
     /// All available images we own, tagged `burst-actions=1` for this repo —
@@ -1827,6 +1951,27 @@ mod tests {
         assert!(is_burst_tagged(&tagged));
         let untagged: [aws_sdk_ec2::types::Tag; 0] = [];
         assert!(!is_burst_tagged(&untagged));
+    }
+
+    #[test]
+    fn instance_id_from_schedule_name_round_trips() {
+        assert_eq!(
+            instance_id_from_schedule_name(&kill_schedule_name("i-0abc")),
+            Some("i-0abc".to_string())
+        );
+    }
+
+    #[test]
+    fn instance_id_from_schedule_name_rejects_non_instance_suffix() {
+        assert_eq!(
+            instance_id_from_schedule_name("burst-actions-somethingelse"),
+            None
+        );
+    }
+
+    #[test]
+    fn instance_id_from_schedule_name_rejects_missing_prefix() {
+        assert_eq!(instance_id_from_schedule_name("other-i-0abc"), None);
     }
 
     #[test]

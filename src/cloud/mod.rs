@@ -51,6 +51,9 @@ pub struct LaunchSpec {
     pub spot: bool,
     pub tags: TagSpec,
     pub user_data: String,
+    /// EC2 key-pair name for SSH access. `None` (the default) launches with
+    /// no SSH key.
+    pub ssh_key: Option<String>,
 }
 
 /// The only seam to a cloud. Sync in phase 1; phase 2 makes these async when
@@ -65,6 +68,17 @@ pub trait Cloud {
     fn arm_kill(&mut self, instance_id: &str, at: DateTime<Utc>) -> Result<(), Error>;
     /// Get-or-create the image for `key`; returns the image id.
     fn bake(&mut self, key: &str) -> Result<String, Error>;
+    /// Delete the one-shot kill schedule for `instance_id`. Already-gone
+    /// (fired and self-deleted, or never armed) is Ok — disarming is
+    /// idempotent.
+    fn disarm_kill(&mut self, instance_id: &str) -> Result<(), Error>;
+    /// Instance ids that currently have an armed kill schedule
+    /// (burst-actions-<id>), across all repos.
+    fn list_armed_kills(&self) -> Result<Vec<String>, Error>;
+    /// All non-terminated instances carrying burst-actions=1, ANY repo.
+    /// The sweep's orphan-schedule check must see other repos' live
+    /// instances, or it would mistake their schedules for orphans.
+    fn list_all_tagged(&self) -> Result<Vec<Instance>, Error>;
 }
 
 pub mod aws;

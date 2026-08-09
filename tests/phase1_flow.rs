@@ -23,6 +23,7 @@ fn abandoned_run_is_adopted_and_reconciled() {
                 expires: Utc::now() + Duration::hours(6),
             },
             user_data: "jit".into(),
+            ssh_key: None,
         })
         .unwrap();
     let rs = RepoState::open_at(dir.path().to_path_buf());
@@ -57,6 +58,7 @@ fn abandoned_run_is_adopted_and_reconciled() {
                 expires: Utc::now() + Duration::hours(6),
             },
             user_data: "jit2".into(),
+            ssh_key: None,
         })
         .unwrap();
 
