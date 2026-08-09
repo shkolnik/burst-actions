@@ -102,7 +102,10 @@ pub fn execute(
     Ok(())
 }
 
-fn describe(action: &SweepAction) -> String {
+/// The single authoring site for sweep-action wording. `up`'s sweep-on-entry
+/// prints through this too, so one event has exactly one spelling wherever
+/// it is reported.
+pub(crate) fn describe(action: &SweepAction) -> String {
     match action {
         SweepAction::TerminateExpired { instance_id } => {
             format!("terminate expired instance {instance_id}")

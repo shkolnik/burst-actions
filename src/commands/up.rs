@@ -118,6 +118,29 @@ pub fn launch_fleet(
     Ok(())
 }
 
+/// How often the detach flag is sampled while waiting out a poll interval.
+/// Ctrl-C must feel immediate; the poll interval is about API politeness, not
+/// about how long a user waits for the tool to acknowledge them.
+const DETACH_SLICE: Duration = Duration::from_millis(100);
+
+/// Sleep up to `total`, returning true as soon as `detach` is set. Sleeping
+/// the whole interval in one call would make Ctrl-C look dead for a poll
+/// interval, and the handler swallows the signal, so the user gets no second
+/// chance from the OS.
+fn sleep_unless_detached(detach: &AtomicBool, total: Duration, slice: Duration) -> bool {
+    let deadline = std::time::Instant::now() + total;
+    loop {
+        if detach.load(Ordering::SeqCst) {
+            return true;
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return false;
+        }
+        std::thread::sleep(remaining.min(slice));
+    }
+}
+
 pub fn watch(
     cloud: &mut impl Cloud,
     repo: &RepoId,
@@ -134,11 +157,23 @@ pub fn watch(
         if live == 0 {
             return Ok(WatchOutcome::FleetGone);
         }
-        if detach.load(Ordering::SeqCst) {
+        // Checked before the wait and again on every slice within it, so a
+        // Ctrl-C at any point in the interval is answered within DETACH_SLICE.
+        if sleep_unless_detached(detach, poll, DETACH_SLICE) {
             return Ok(WatchOutcome::Detached { live });
         }
-        std::thread::sleep(poll);
     }
+}
+
+/// One line per sweep-on-entry action, in `sweep`'s own wording — the
+/// sweep-on-entry terminates instances (possibly ones just reported as
+/// adopted), so it is never silent. Split out of `run` only so that
+/// never-silent property is testable offline.
+fn sweep_report(actions: &[super::sweep::SweepAction]) -> Vec<String> {
+    actions
+        .iter()
+        .map(|a| format!("sweep: {}", super::sweep::describe(a)))
+        .collect()
 }
 
 static DETACH: AtomicBool = AtomicBool::new(false);
@@ -191,8 +226,16 @@ pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
         state.write(&manifest)?;
     }
 
-    // 4. Sweep-on-entry: rent paid on entry.
-    super::sweep::sweep_with(&mut p.cloud, &p.client, &config.repo)?;
+    // 4. Sweep-on-entry: rent paid on entry. It terminates instances — possibly
+    //    ones just reported as adopted — so it reports every action, in sweep's
+    //    own wording. Silence here would be a second spelling of one event.
+    for line in sweep_report(&super::sweep::sweep_with(
+        &mut p.cloud,
+        &p.client,
+        &config.repo,
+    )?) {
+        println!("{line}");
+    }
 
     // 5. Preflight (invariant 5) — nothing has launched yet.
     let policy = p.client.fork_approval_policy(&config.repo)?;
@@ -564,6 +607,80 @@ mod tests {
             WatchOutcome::FleetGone
         );
         assert_eq!(cloud.polls.get(), 2, "must have polled again, not guessed");
+    }
+
+    #[test]
+    fn sweep_on_entry_reports_every_action_in_sweeps_own_wording() {
+        use super::super::sweep::SweepAction;
+        let actions = [
+            SweepAction::TerminateExpired {
+                instance_id: "i-aaa".into(),
+            },
+            SweepAction::DisarmOrphanSchedule {
+                instance_id: "i-bbb".into(),
+            },
+            SweepAction::DeleteDeadRegistration {
+                id: 7,
+                name: "burst-xyz".into(),
+            },
+        ];
+        let lines = sweep_report(&actions);
+        assert_eq!(
+            lines.len(),
+            actions.len(),
+            "a destructive sweep action must never be silent"
+        );
+        for (line, action) in lines.iter().zip(&actions) {
+            assert_eq!(
+                line.as_str(),
+                format!("sweep: {}", super::super::sweep::describe(action)),
+                "up must reuse sweep's wording, not spell the event a second way"
+            );
+        }
+        assert!(lines[0].contains("i-aaa"));
+    }
+
+    #[test]
+    fn no_sweep_actions_prints_nothing() {
+        assert!(sweep_report(&[]).is_empty());
+    }
+
+    #[test]
+    fn a_ctrl_c_mid_interval_is_answered_within_one_slice_not_one_poll() {
+        // The flag is set by another thread partway through a 30 s poll
+        // interval; the wait must end promptly, not at the interval's end.
+        let detach = std::sync::Arc::new(AtomicBool::new(false));
+        let setter = std::sync::Arc::clone(&detach);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            setter.store(true, Ordering::SeqCst);
+        });
+        let start = std::time::Instant::now();
+        assert!(sleep_unless_detached(
+            &detach,
+            Duration::from_secs(30),
+            Duration::from_millis(10)
+        ));
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "detach took {:?} — a Ctrl-C must not wait out the poll interval",
+            start.elapsed()
+        );
+    }
+
+    #[test]
+    fn an_undisturbed_interval_waits_it_out_and_reports_no_detach() {
+        let detach = AtomicBool::new(false);
+        let start = std::time::Instant::now();
+        assert!(!sleep_unless_detached(
+            &detach,
+            Duration::from_millis(120),
+            Duration::from_millis(10)
+        ));
+        assert!(
+            start.elapsed() >= Duration::from_millis(120),
+            "slicing must not shorten the poll interval"
+        );
     }
 
     #[test]
