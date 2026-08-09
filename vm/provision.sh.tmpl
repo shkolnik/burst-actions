@@ -8,6 +8,13 @@ set -euo pipefail
 
 export DEBIAN_FRONTEND=noninteractive
 
+# Ubuntu's first-boot unattended-upgrades run holds the dpkg lock for many
+# minutes; any later apt call here (e.g. the runner's installdependencies.sh)
+# collides with it and dies under set -e. Ephemeral VMs never live long
+# enough to want self-updates — remove the whole mechanism before first use.
+systemctl stop --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true
+apt-get -y purge unattended-upgrades || true
+
 apt-get update
 apt-get install -y \
     build-essential curl git jq unzip \
