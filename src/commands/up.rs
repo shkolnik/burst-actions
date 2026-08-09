@@ -42,6 +42,8 @@ pub fn launch_fleet(
     manifest: &mut StateFile,
     count: u32,
     expires: DateTime<Utc>,
+    idle_timeout_min: u32,
+    ttl_hours: u32,
     spot: bool,
     ssh_key: Option<&str>,
     image_id: &str,
@@ -60,7 +62,8 @@ pub fn launch_fleet(
         let nonce = github::runner_nonce();
         let name = github::runner_name(&nonce);
         let jit = mint(&name).map_err(|e| partial(launched, e))?;
-        let user_data = crate::payload::fleet_user_data(&jit).map_err(|e| partial(launched, e))?;
+        let user_data = crate::payload::fleet_user_data(&jit, idle_timeout_min, ttl_hours)
+            .map_err(|e| partial(launched, e))?;
         let instances = cloud
             .launch(&LaunchSpec {
                 count: 1,
@@ -296,6 +299,8 @@ pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
             &mut manifest,
             to_launch,
             expires,
+            config.idle_timeout_min,
+            config.ttl_hours,
             args.spot,
             args.ssh_key.as_deref(),
             &image_id,
@@ -427,6 +432,8 @@ mod tests {
             &mut m,
             3,
             expires,
+            10,
+            6,
             false,
             None,
             "ami-x",
@@ -475,6 +482,8 @@ mod tests {
             &mut m,
             3,
             Utc::now() + ChronoDuration::hours(6),
+            10,
+            6,
             false,
             None,
             "ami-x",
@@ -550,6 +559,8 @@ mod tests {
             &mut m,
             2,
             Utc::now() + ChronoDuration::hours(6),
+            10,
+            6,
             false,
             None,
             "ami-x",

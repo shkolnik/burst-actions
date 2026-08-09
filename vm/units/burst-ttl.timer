@@ -1,8 +1,13 @@
 [Unit]
-Description=burst hard TTL — unconditional poweroff cap
+Description=burst hard TTL — periodic uptime-vs-TTL check
 
 [Timer]
-OnBootSec=__BURST_TTL_HOURS__h
+# Periodic check rather than a fixed OnBootSec deadline: the TTL value
+# arrives per-launch in /etc/burst/launch.env, which may not exist when the
+# timer arms at boot. The check reads it (or the baked default) on every
+# fire, so the timer stays armed-at-boot independent of user-data.
+OnBootSec=5min
+OnUnitActiveSec=5min
 AccuracySec=1min
 
 [Install]

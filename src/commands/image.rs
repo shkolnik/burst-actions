@@ -48,7 +48,7 @@ pub fn prepare(config: &Config) -> Result<Prepared, Error> {
         }
     };
 
-    let rendered = render_provision(config.idle_timeout_min, config.ttl_hours, &agent_version)?;
+    let rendered = render_provision(&agent_version)?;
     let key = image_key(&ImageKeyInputs {
         provisioning_script: rendered.as_bytes(),
         base_image_id: &base_ami,

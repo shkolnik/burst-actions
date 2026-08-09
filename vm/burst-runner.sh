@@ -10,10 +10,16 @@ rm -f /run/burst/registered /run/burst/job-started
 
 JITCONFIG="$(cat /etc/burst/jitconfig)"
 
+# Idle timeout from launch user-data (written before this service starts);
+# the default is the backstop for an env file that never appeared.
+IDLE_TIMEOUT_MIN=10
+# shellcheck disable=SC1091  # runtime file, not available to the linter
+[ -f /etc/burst/launch.env ] && . /etc/burst/launch.env
+
 # Background watchdog: if the runner never picks up a job within the idle
 # timeout, power off rather than bill for an idle instance.
 (
-  sleep "__BURST_IDLE_TIMEOUT_MIN__"m
+  sleep "${IDLE_TIMEOUT_MIN}"m
   if [ ! -f /run/burst/job-started ]; then
     systemctl poweroff
   fi
