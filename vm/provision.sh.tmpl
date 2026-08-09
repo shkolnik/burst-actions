@@ -15,14 +15,33 @@ export DEBIAN_FRONTEND=noninteractive
 systemctl stop --now unattended-upgrades.service apt-daily.timer apt-daily-upgrade.timer || true
 apt-get -y purge unattended-upgrades || true
 
-apt-get update
-apt-get install -y \
-    build-essential curl git jq unzip \
-    chromium-browser firefox xvfb \
-    libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2t64
+# Browser package names differ per distro (Ubuntu's chromium/firefox debs
+# are snap-transitional stubs); everything else below is name-identical on
+# Debian 13 and Ubuntu 24.04. Unknown base OS fails the bake loudly.
+# shellcheck disable=SC1091  # runtime file, not available to the linter
+. /etc/os-release
+case "$ID" in
+  debian) browsers="chromium firefox-esr" ;;
+  ubuntu) browsers="chromium-browser firefox" ;;
+  *) echo "unsupported base OS '$ID': need debian or ubuntu" >&2; exit 1 ;;
+esac
 
-# rustup for the ubuntu user (build tooling available to jobs that need it).
-sudo -u ubuntu -H sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
+apt-get update
+# shellcheck disable=SC2086  # $browsers is a deliberate word-split list
+apt-get install -y \
+    build-essential curl git jq unzip sudo \
+    $browsers xvfb \
+    libnss3 libatk-bridge2.0-0t64 libgtk-3-0t64 libgbm1 libasound2t64
+
+# Dedicated job user, independent of the distro's cloud default user.
+# Passwordless sudo matches GitHub-hosted runner capability (jobs routinely
+# apt-get install); the VM is single-tenant and ephemeral.
+useradd -m -s /bin/bash burst
+echo 'burst ALL=(ALL) NOPASSWD:ALL' > /etc/sudoers.d/burst
+chmod 0440 /etc/sudoers.d/burst
+
+# rustup for the burst user (build tooling available to jobs that need it).
+runuser -u burst -- sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal'
 
 # GitHub Actions runner, pinned to the version resolved at bake time.
 mkdir -p /opt/actions-runner
@@ -31,7 +50,7 @@ curl -fsSL -o actions-runner.tar.gz \
     "https://github.com/actions/runner/releases/download/v__BURST_AGENT_VERSION__/actions-runner-linux-x64-__BURST_AGENT_VERSION__.tar.gz"
 tar xzf actions-runner.tar.gz
 rm actions-runner.tar.gz
-chown -R ubuntu:ubuntu /opt/actions-runner
+chown -R burst:burst /opt/actions-runner
 ./bin/installdependencies.sh
 
 mkdir -p /etc/burst /opt/burst /run/burst

@@ -567,23 +567,24 @@ impl AwsContext {
             .unwrap_or_default()
     }
 
-    /// Resolve the current Ubuntu 24.04 LTS AMI id for `arch`: owner
-    /// Canonical (099720109477), gp3 HVM SSD, newest by creation date.
+    /// Resolve the current Debian 13 (trixie) AMI id for `arch`: official
+    /// Debian owner account (136693071363), newest by creation date.
     /// Read-only `DescribeImages` — never creates or pins anything; §8.6
     /// requires the caller to pin the result into `burst.toml` explicitly.
-    pub fn resolve_latest_ubuntu_ami(&self, arch: Arch) -> Result<String, Error> {
+    /// Ubuntu (or anything else) stays supported via an explicit
+    /// `base_ami` pin.
+    pub fn resolve_latest_debian_ami(&self, arch: Arch) -> Result<String, Error> {
         let arch_name = match arch {
             Arch::X86_64 => "amd64",
             Arch::Arm64 => "arm64",
         };
-        let name_filter =
-            format!("ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-{arch_name}-server-*");
+        let name_filter = format!("debian-13-{arch_name}-*");
 
         self.runtime.block_on(async {
             let out = self
                 .ec2
                 .describe_images()
-                .owners("099720109477")
+                .owners("136693071363")
                 .filters(
                     aws_sdk_ec2::types::Filter::builder()
                         .name("name")
@@ -599,7 +600,7 @@ impl AwsContext {
                 .send()
                 .await
                 .map_err(|e| Error::Aws {
-                    op: "DescribeImages(ubuntu)",
+                    op: "DescribeImages(debian)",
                     message: format_aws_error(&e),
                 })?;
 
@@ -616,9 +617,9 @@ impl AwsContext {
                 .first()
                 .map(|(id, _)| id.to_string())
                 .ok_or_else(|| Error::Aws {
-                    op: "DescribeImages(ubuntu)",
+                    op: "DescribeImages(debian)",
                     message: format!(
-                        "no available Ubuntu 24.04 LTS AMI found for {arch_name} in this region"
+                        "no available Debian 13 AMI found for {arch_name} in this region"
                     ),
                 })
         })

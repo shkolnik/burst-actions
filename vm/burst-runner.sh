@@ -20,7 +20,10 @@ JITCONFIG="$(cat /etc/burst/jitconfig)"
 ) &
 
 cd /opt/actions-runner
-runuser -u ubuntu -- ./run.sh --jitconfig "$JITCONFIG" --disableupdate 2>&1 | while IFS= read -r line; do
+# `|| true`: a nonzero run.sh exit (bad JIT config, agent crash) must not
+# let set -e skip the poweroff below — a failed runner still means this
+# VM is done.
+runuser -u burst -- ./run.sh --jitconfig "$JITCONFIG" --disableupdate 2>&1 | while IFS= read -r line; do
   echo "$line"
   case "$line" in
     *"Listening for Jobs"*)
@@ -30,7 +33,7 @@ runuser -u ubuntu -- ./run.sh --jitconfig "$JITCONFIG" --disableupdate 2>&1 | wh
       touch /run/burst/job-started
       ;;
   esac
-done
+done || true
 
 # run.sh exited: the one job is done (or the runner errored out). Either way
 # this VM's job is finished — power off.

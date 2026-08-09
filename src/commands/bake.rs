@@ -25,10 +25,10 @@ pub fn run(config: &Config) -> Result<(), Error> {
     let base_ami = match &config.base_ami {
         Some(ami) => ami.clone(),
         None => {
-            let resolved = ctx.resolve_latest_ubuntu_ami(config.arch)?;
+            let resolved = ctx.resolve_latest_debian_ami(config.arch)?;
             return Err(Error::Environment {
                 reason: format!(
-                    "no base_ami pinned: set base_ami = \"{resolved}\" in burst.toml (current Ubuntu 24.04 LTS {arch} in {region})",
+                    "no base_ami pinned: set base_ami = \"{resolved}\" in burst.toml (current Debian 13 {arch} in {region})",
                     arch = config.arch.as_str(),
                     region = ctx.region_str(),
                 ),
