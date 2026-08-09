@@ -3,6 +3,7 @@
 //! testable offline.
 
 pub mod bake;
+pub mod down;
 pub mod image;
 pub mod status;
 pub mod sweep;

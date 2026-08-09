@@ -37,12 +37,26 @@ fn up_n_and_auto_conflict() {
 }
 
 #[test]
-fn subcommands_fail_loud_not_silent() {
+fn down_fails_loud_offline_not_silently() {
+    // Like status, down's first step is a bare AWS list — no GitHub call
+    // yet — so (as in status_fails_loud_offline_not_silently) only killing
+    // every region source forces a fast, local, no-real-AWS-touched
+    // failure; this host's ~/.aws/credentials would otherwise resolve real
+    // credentials and down would truthfully report an empty fleet instead
+    // of failing.
     burst()
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env("AWS_CONFIG_FILE", "/nonexistent/config")
+        .env("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/credentials")
         .args(["down", "--repo", "octo/widgets"])
         .assert()
         .code(1)
-        .stderr(predicate::str::contains("not implemented yet"));
+        .stderr(predicate::str::contains("error:"));
 }
 
 #[test]
