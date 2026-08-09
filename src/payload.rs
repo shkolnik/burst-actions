@@ -207,6 +207,52 @@ mod tests {
         assert!(ud.contains("systemctl start burst-runner.service"));
     }
 
+    /// The bootstrap deadline (G3, layer 3) only works because the runner
+    /// wrapper and the deadline check agree on one sentinel path. A rename
+    /// in either file would silently disarm the layer: the deadline would
+    /// check a path nobody touches and poweroff every healthy instance —
+    /// or worse, never fire.
+    #[test]
+    fn bootstrap_deadline_checks_the_exact_path_the_runner_touches() {
+        const SENTINEL: &str = "/run/burst/registered";
+        assert!(
+            RUNNER_SH.contains(&format!("touch {SENTINEL}")),
+            "runner wrapper must touch the registration sentinel"
+        );
+        assert!(
+            BOOTSTRAP_SERVICE.contains(&format!("[ -f {SENTINEL} ]")),
+            "deadline must check the same sentinel path"
+        );
+    }
+
+    /// Layers 3 (bootstrap deadline, TTL) are armed only because the bake
+    /// enables their timers. Losing this line from the template ships an
+    /// image whose on-VM cleanup never runs — exactly the G3/G4a properties
+    /// verified live.
+    #[test]
+    fn provision_enables_both_cleanup_timers() {
+        let rendered = render_provision(10, 6, "2.320.0").unwrap();
+        assert!(
+            rendered.contains("systemctl enable burst-bootstrap-deadline.timer burst-ttl.timer"),
+            "bake must enable the bootstrap-deadline and ttl timers"
+        );
+    }
+
+    /// The unit's ExecStart and the template's install path must name the
+    /// same file, or the runner never starts and every instance dies at the
+    /// bootstrap deadline.
+    #[test]
+    fn runner_unit_execstart_matches_the_installed_path() {
+        assert!(
+            RUNNER_SERVICE.contains("ExecStart=/opt/burst/burst-runner.sh"),
+            "unit must exec the path provision installs"
+        );
+        assert!(
+            PROVISION_TMPL.contains("/opt/burst/burst-runner.sh"),
+            "provision must install the runner wrapper at the unit's path"
+        );
+    }
+
     #[test]
     fn different_ttl_hours_change_image_key() {
         let a = render_provision(10, 6, "2.320.0").unwrap();
