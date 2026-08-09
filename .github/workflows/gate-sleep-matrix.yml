@@ -1,0 +1,32 @@
+# Phase-3 gate scaffolding: synthetic sleep-job matrix for kill-testing
+# (implementation-phases.md Task 12). Manually dispatched only; remove after
+# the gate.
+name: gate-sleep-matrix
+on:
+  workflow_dispatch:
+    inputs:
+      jobs:
+        description: "number of matrix jobs"
+        default: "4"
+      sleep:
+        description: "seconds each job sleeps"
+        default: "120"
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      ids: ${{ steps.gen.outputs.ids }}
+    steps:
+      - id: gen
+        run: |
+          n=${{ github.event.inputs.jobs }}
+          ids=$(seq 1 "$n" | jq -cs .)
+          echo "ids=$ids" >> "$GITHUB_OUTPUT"
+  burst:
+    needs: plan
+    strategy:
+      matrix:
+        id: ${{ fromJSON(needs.plan.outputs.ids) }}
+    runs-on: [self-hosted, burst]
+    steps:
+      - run: sleep ${{ github.event.inputs.sleep }}
