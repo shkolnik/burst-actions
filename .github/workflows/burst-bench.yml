@@ -1,0 +1,33 @@
+# Phase-4 measurement workflow. Two modes, same 6 work units:
+#   matrix — 6 parallel jobs, one burst VM each (the product being measured)
+#   serial — 1 job running all 6 units back-to-back on one VM (the baseline)
+name: burst-bench
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [matrix, serial]
+        required: true
+      target_seconds:
+        type: string
+        default: "600"
+jobs:
+  bench:
+    if: inputs.mode == 'matrix'
+    strategy:
+      matrix:
+        seed: [1, 2, 3, 4, 5, 6]
+    runs-on: [self-hosted, burst]
+    steps:
+      - uses: actions/checkout@v4
+      - run: bench/run-bench.sh "${{ inputs.target_seconds }}" "${{ matrix.seed }}"
+  serial:
+    if: inputs.mode == 'serial'
+    runs-on: [self-hosted, burst]
+    steps:
+      - uses: actions/checkout@v4
+      - run: |
+          for seed in 1 2 3 4 5 6; do
+            bench/run-bench.sh "${{ inputs.target_seconds }}" "$seed"
+          done
