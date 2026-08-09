@@ -191,7 +191,7 @@ them and GitHub ages them out anyway.
 
 Boot-time dependency install would add 5–10 min to every VM — exactly the latency this tool
 exists to remove — so CI dependencies are baked into an AMI, built by the tool itself (no
-Packer/Ansible): launch a builder from stock Ubuntu LTS, run the version-controlled
+Packer/Ansible): launch a builder from stock Debian stable, run the version-controlled
 provisioning script (toolchain, runner agent, browsers, X stack, VM agent + units), optionally
 warm `target/` via `cargo build` against main, `CreateImage`, terminate the builder. The builder
 carries the same tags and kill-schedule as any fleet VM.
@@ -346,8 +346,12 @@ none blocks rollout step 1:
 5. **Region.** Default from the AWS profile; the AMI is region-bound, so a region change is a
    full cache miss (fine, just worth knowing). Spot capacity varies by region/AZ if `--spot` is
    used.
-6. **Base image pinning.** The image key includes the base image ID — so resolving "latest Ubuntu
-   LTS" at bake time means every upstream AMI refresh is a surprise rebake, while pinning an ID
+6. **Base image pinning.** Base OS: Debian stable (currently 13 "trixie") — matches the CI
+   docker images and actions-runner's own base, and its browsers are real debs
+   (`chromium`, `firefox-esr`), avoiding Ubuntu's snap-transitional packages. Ubuntu remains
+   usable via the `base_ami` pin (tool supports both; Debian is the tested default). The image
+   key includes the base image ID — so resolving "latest Debian
+   stable" at bake time means every upstream AMI refresh is a surprise rebake, while pinning an ID
    means deliberate bumps (edit the pin in the provisioning config). Default: pin; the config is
    versioned anyway and surprise 15-minute bakes are exactly the latency this tool fights.
 7. **Accounts without a default VPC.** `ensure_substrate()` assumes a default VPC exists for the

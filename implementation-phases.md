@@ -74,7 +74,7 @@ needed to close this phase's stated gate.
 - `ensure_substrate()`: get-or-create both IAM roles, security group (zero inbound), opt-in
   budget alarm, under deterministic `burst-actions-*` names; the IAM eventual-consistency retry (§5);
   fail-loud on missing default VPC (§8.7).
-- VM payload authored & baked: provisioning script (pinned Ubuntu LTS base per §8.6, toolchain,
+- VM payload authored & baked: provisioning script (pinned Debian stable base per §8.6, toolchain,
   runner agent `--disableupdate`, browsers/X, VM agent), systemd units for the three on-VM
   timers (bootstrap deadline, never-assigned idle, hard TTL).
 - `burst bake` end-to-end: tagged+kill-armed builder → provision → `CreateImage` → stamp key
