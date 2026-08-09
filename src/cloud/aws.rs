@@ -1,5 +1,11 @@
+use super::{Cloud, Instance, InstanceState, LaunchSpec};
 use crate::error::Error;
+use crate::schema::{RepoId, TAG_BURST, TAG_REPO};
+use aws_sdk_ec2::error::ProvideErrorMetadata;
 use aws_smithy_types::error::display::DisplayErrorContext;
+use base64::Engine;
+use chrono::{DateTime, Utc};
+use std::time::Duration;
 
 /// Substrings that, when found in the full error chain (or an AWS service
 /// error code), indicate the failure is a credentials/auth problem rather
@@ -553,6 +559,312 @@ impl AwsContext {
     }
 }
 
+/// True for the transient invalid-instance-profile error RunInstances returns
+/// in the seconds after ensure_substrate() creates the role on a fresh
+/// account (AWS IAM is eventually consistent). Verified live at the phase-2
+/// gate; the message fragment is AWS's, not ours.
+pub(crate) fn is_iam_propagation_error(code: &str, message: &str) -> bool {
+    code == "InvalidParameterValue" && message.contains("Invalid IAM Instance Profile")
+}
+
+/// Bounded backoff for the IAM-propagation retry: 6 delays summing to ~60s.
+pub(crate) fn retry_delays() -> impl Iterator<Item = Duration> {
+    [2u64, 4, 8, 15, 15, 15]
+        .into_iter()
+        .map(Duration::from_secs)
+}
+
+/// Map an EC2 `instance-state-name` into our closed [`InstanceState`] set.
+/// Exhaustive over the six documented names; an unrecognized name is a fail
+/// -loud `Error::Aws`, never a silent skip.
+#[allow(clippy::wildcard_enum_match_arm)] // N is #[non_exhaustive]; the wildcard is the fail-loud catch-all for unrecognized/future state names, not a lazy default
+fn map_instance_state(
+    name: &aws_sdk_ec2::types::InstanceStateName,
+) -> Result<InstanceState, Error> {
+    use aws_sdk_ec2::types::InstanceStateName as N;
+    match name {
+        N::Pending => Ok(InstanceState::Pending),
+        N::Running => Ok(InstanceState::Running),
+        N::ShuttingDown => Ok(InstanceState::ShuttingDown),
+        N::Terminated => Ok(InstanceState::Terminated),
+        N::Stopping => Ok(InstanceState::Stopping),
+        N::Stopped => Ok(InstanceState::Stopped),
+        other => Err(Error::Aws {
+            op: "DescribeInstances",
+            message: format!("unrecognized instance state name {other:?}"),
+        }),
+    }
+}
+
+/// Live AWS backend: the `Cloud` seam over `AwsContext` + the substrate
+/// `ensure_substrate` produced.
+pub struct AwsCloud {
+    pub ctx: AwsContext,
+    pub substrate: Substrate,
+}
+
+fn tag_specification(
+    resource_type: aws_sdk_ec2::types::ResourceType,
+    tags: &[(String, String)],
+) -> aws_sdk_ec2::types::TagSpecification {
+    let mut builder = aws_sdk_ec2::types::TagSpecification::builder().resource_type(resource_type);
+    for (k, v) in tags {
+        builder = builder.tags(aws_sdk_ec2::types::Tag::builder().key(k).value(v).build());
+    }
+    builder.build()
+}
+
+impl Cloud for AwsCloud {
+    fn launch(&mut self, spec: &LaunchSpec) -> Result<Vec<Instance>, Error> {
+        let tags = spec.tags.to_tags();
+        let instance_tags = tag_specification(aws_sdk_ec2::types::ResourceType::Instance, &tags);
+        let volume_tags = tag_specification(aws_sdk_ec2::types::ResourceType::Volume, &tags);
+
+        let mut market_options = None;
+        if spec.spot {
+            let spot_options = aws_sdk_ec2::types::SpotMarketOptions::builder()
+                .spot_instance_type(aws_sdk_ec2::types::SpotInstanceType::OneTime)
+                .instance_interruption_behavior(
+                    aws_sdk_ec2::types::InstanceInterruptionBehavior::Terminate,
+                )
+                .build();
+            market_options = Some(
+                aws_sdk_ec2::types::InstanceMarketOptionsRequest::builder()
+                    .market_type(aws_sdk_ec2::types::MarketType::Spot)
+                    .spot_options(spot_options)
+                    .build(),
+            );
+        }
+
+        let user_data_b64 = base64::engine::general_purpose::STANDARD.encode(&spec.user_data);
+
+        self.ctx.runtime.block_on(async {
+            let mut delays = retry_delays();
+            loop {
+                let mut request = self
+                    .ctx
+                    .ec2
+                    .run_instances()
+                    .min_count(spec.count as i32)
+                    .max_count(spec.count as i32)
+                    .image_id(&spec.image_id)
+                    .instance_type(aws_sdk_ec2::types::InstanceType::from(spec.instance_type.as_str()))
+                    .security_group_ids(&self.substrate.security_group_id)
+                    .subnet_id(&self.substrate.subnet_id)
+                    .iam_instance_profile(
+                        aws_sdk_ec2::types::IamInstanceProfileSpecification::builder()
+                            .name(&self.substrate.instance_profile_name)
+                            .build(),
+                    )
+                    .user_data(&user_data_b64)
+                    .instance_initiated_shutdown_behavior(aws_sdk_ec2::types::ShutdownBehavior::Terminate)
+                    .metadata_options(
+                        aws_sdk_ec2::types::InstanceMetadataOptionsRequest::builder()
+                            .http_tokens(aws_sdk_ec2::types::HttpTokensState::Required)
+                            .build(),
+                    )
+                    .tag_specifications(instance_tags.clone())
+                    .tag_specifications(volume_tags.clone());
+                if let Some(m) = market_options.clone() {
+                    request = request.instance_market_options(m);
+                }
+
+                match request.send().await {
+                    Ok(out) => {
+                        let instances = out
+                            .instances()
+                            .iter()
+                            .map(|i| -> Result<Instance, Error> {
+                                let id = i.instance_id().ok_or_else(|| Error::Aws {
+                                    op: "RunInstances",
+                                    message: "response instance had no id".to_string(),
+                                })?;
+                                let state = i.state().and_then(|s| s.name()).ok_or_else(|| Error::Aws {
+                                    op: "RunInstances",
+                                    message: format!("instance {id} had no state"),
+                                })?;
+                                Ok(Instance {
+                                    id: id.to_string(),
+                                    state: map_instance_state(state)?,
+                                    tags: tags.to_vec(),
+                                })
+                            })
+                            .collect::<Result<Vec<_>, _>>()?;
+                        return Ok(instances);
+                    }
+                    Err(e) => {
+                        let code = e.code().unwrap_or_default();
+                        let message = e.message().unwrap_or_default();
+                        if is_iam_propagation_error(code, message) {
+                            if let Some(delay) = delays.next() {
+                                tokio::time::sleep(delay).await;
+                                continue;
+                            }
+                            return Err(Error::Aws {
+                                op: "RunInstances",
+                                message: format!(
+                                    "IAM role propagation did not settle after 60s — retry `burst bake` ({})",
+                                    format_aws_error(&e)
+                                ),
+                            });
+                        }
+                        return Err(Error::Aws {
+                            op: "RunInstances",
+                            message: format_aws_error(&e),
+                        });
+                    }
+                }
+            }
+        })
+    }
+
+    fn terminate(&mut self, ids: &[String]) -> Result<(), Error> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        self.ctx.runtime.block_on(async {
+            let describe = self
+                .ctx
+                .ec2
+                .describe_instances()
+                .set_instance_ids(Some(ids.to_vec()))
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name(format!("tag:{TAG_BURST}"))
+                        .values("1")
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "terminate",
+                    message: format_aws_error(&e),
+                })?;
+
+            let verified: std::collections::HashSet<String> = describe
+                .reservations()
+                .iter()
+                .flat_map(|r| r.instances())
+                .filter_map(|i| i.instance_id().map(str::to_string))
+                .collect();
+
+            for id in ids {
+                if !verified.contains(id) {
+                    return Err(Error::Aws {
+                        op: "terminate",
+                        message: format!(
+                            "refusing to terminate {id}: not verified as carrying burst-actions=1"
+                        ),
+                    });
+                }
+            }
+
+            self.ctx
+                .ec2
+                .terminate_instances()
+                .set_instance_ids(Some(ids.to_vec()))
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "TerminateInstances",
+                    message: format_aws_error(&e),
+                })?;
+
+            Ok(())
+        })
+    }
+
+    fn list_tagged(&self, repo: &RepoId) -> Result<Vec<Instance>, Error> {
+        self.ctx.runtime.block_on(async {
+            let mut out = Vec::new();
+            let mut next_token: Option<String> = None;
+            loop {
+                let mut request = self
+                    .ctx
+                    .ec2
+                    .describe_instances()
+                    .filters(
+                        aws_sdk_ec2::types::Filter::builder()
+                            .name(format!("tag:{TAG_BURST}"))
+                            .values("1")
+                            .build(),
+                    )
+                    .filters(
+                        aws_sdk_ec2::types::Filter::builder()
+                            .name(format!("tag:{TAG_REPO}"))
+                            .values(repo.to_string())
+                            .build(),
+                    )
+                    .filters(
+                        aws_sdk_ec2::types::Filter::builder()
+                            .name("instance-state-name")
+                            .values("pending")
+                            .values("running")
+                            .values("shutting-down")
+                            .values("stopping")
+                            .values("stopped")
+                            .build(),
+                    );
+                if let Some(token) = &next_token {
+                    request = request.next_token(token);
+                }
+
+                let output = request.send().await.map_err(|e| Error::Aws {
+                    op: "DescribeInstances",
+                    message: format_aws_error(&e),
+                })?;
+
+                for reservation in output.reservations() {
+                    for instance in reservation.instances() {
+                        let id = instance.instance_id().ok_or_else(|| Error::Aws {
+                            op: "DescribeInstances",
+                            message: "response instance had no id".to_string(),
+                        })?;
+                        let state_name =
+                            instance
+                                .state()
+                                .and_then(|s| s.name())
+                                .ok_or_else(|| Error::Aws {
+                                    op: "DescribeInstances",
+                                    message: format!("instance {id} had no state"),
+                                })?;
+                        let tags = instance
+                            .tags()
+                            .iter()
+                            .filter_map(|t| Some((t.key()?.to_string(), t.value()?.to_string())))
+                            .collect();
+                        out.push(Instance {
+                            id: id.to_string(),
+                            state: map_instance_state(state_name)?,
+                            tags,
+                        });
+                    }
+                }
+
+                next_token = output.next_token().map(str::to_string);
+                if next_token.is_none() {
+                    break;
+                }
+            }
+            Ok(out)
+        })
+    }
+
+    fn arm_kill(&mut self, _instance_id: &str, _at: DateTime<Utc>) -> Result<(), Error> {
+        Err(Error::Aws {
+            op: "arm_kill",
+            message: "not implemented until task 6/8".to_string(),
+        })
+    }
+
+    fn bake(&mut self, _key: &str) -> Result<String, Error> {
+        Err(Error::Aws {
+            op: "bake",
+            message: "not implemented until task 6/8".to_string(),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -693,6 +1005,72 @@ mod tests {
                 }]
             })
         );
+    }
+
+    #[test]
+    fn iam_propagation_error_detected() {
+        assert!(is_iam_propagation_error(
+            "InvalidParameterValue",
+            "Invalid IAM Instance Profile name"
+        ));
+    }
+
+    #[test]
+    fn iam_propagation_error_requires_matching_message() {
+        assert!(!is_iam_propagation_error(
+            "InvalidParameterValue",
+            "some other message"
+        ));
+    }
+
+    #[test]
+    fn iam_propagation_error_requires_matching_code() {
+        assert!(!is_iam_propagation_error(
+            "UnauthorizedOperation",
+            "Invalid IAM Instance Profile name"
+        ));
+    }
+
+    #[test]
+    fn retry_delays_are_six_entries_summing_to_59s() {
+        let delays: Vec<Duration> = retry_delays().collect();
+        assert_eq!(delays.len(), 6);
+        assert_eq!(delays.iter().sum::<Duration>(), Duration::from_secs(59));
+    }
+
+    #[test]
+    fn instance_state_mapping_covers_all_documented_names() {
+        use aws_sdk_ec2::types::InstanceStateName as N;
+        assert_eq!(
+            map_instance_state(&N::Pending).unwrap(),
+            InstanceState::Pending
+        );
+        assert_eq!(
+            map_instance_state(&N::Running).unwrap(),
+            InstanceState::Running
+        );
+        assert_eq!(
+            map_instance_state(&N::ShuttingDown).unwrap(),
+            InstanceState::ShuttingDown
+        );
+        assert_eq!(
+            map_instance_state(&N::Terminated).unwrap(),
+            InstanceState::Terminated
+        );
+        assert_eq!(
+            map_instance_state(&N::Stopping).unwrap(),
+            InstanceState::Stopping
+        );
+        assert_eq!(
+            map_instance_state(&N::Stopped).unwrap(),
+            InstanceState::Stopped
+        );
+    }
+
+    #[test]
+    fn instance_state_mapping_errors_on_unrecognized_name() {
+        let weird = aws_sdk_ec2::types::InstanceStateName::from("weird");
+        assert!(matches!(map_instance_state(&weird), Err(Error::Aws { .. })));
     }
 
     #[test]
