@@ -7,3 +7,4 @@ pub mod down;
 pub mod image;
 pub mod status;
 pub mod sweep;
+pub mod up;

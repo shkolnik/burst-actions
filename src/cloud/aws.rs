@@ -56,6 +56,7 @@ pub struct AwsContext {
     iam: aws_sdk_iam::Client,
     budgets: aws_sdk_budgets::Client,
     sts: aws_sdk_sts::Client,
+    servicequotas: aws_sdk_servicequotas::Client,
 }
 
 /// The substrate `ensure_substrate` produces: the roles, security group, and
@@ -152,6 +153,7 @@ impl AwsContext {
         let iam = aws_sdk_iam::Client::new(&sdk_config);
         let budgets = aws_sdk_budgets::Client::new(&sdk_config);
         let sts = aws_sdk_sts::Client::new(&sdk_config);
+        let servicequotas = aws_sdk_servicequotas::Client::new(&sdk_config);
 
         Ok(AwsContext {
             runtime,
@@ -160,6 +162,7 @@ impl AwsContext {
             iam,
             budgets,
             sts,
+            servicequotas,
         })
     }
 
@@ -625,6 +628,101 @@ impl AwsContext {
                     message: format!(
                         "no available Debian 13 AMI found for {arch_name} in this region"
                     ),
+                })
+        })
+    }
+
+    /// vCPU headroom under the account's on-demand (L-1216C47A, "Running
+    /// On-Demand Standard instances") or spot (L-34B43A08, "All Standard Spot
+    /// Instance Requests") vCPU quota: quota value minus the vCPUs of
+    /// currently running instances (DescribeInstances, running, summed
+    /// CpuOptions core_count * threads_per_core). Quota codes are cached
+    /// external facts — verified at the gate. A failure here (e.g.
+    /// AccessDenied on `servicequotas:GetServiceQuota`) is a hard
+    /// `Error::Aws` naming the missing permission — the advisory check never
+    /// silently skips (decision 9).
+    pub fn vcpu_headroom(&self, spot: bool) -> Result<u32, Error> {
+        let quota_code = if spot { "L-34B43A08" } else { "L-1216C47A" };
+
+        self.runtime.block_on(async {
+            let quota = self
+                .servicequotas
+                .get_service_quota()
+                .service_code("ec2")
+                .quota_code(quota_code)
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "GetServiceQuota",
+                    message: format!(
+                        "{} (requires servicequotas:GetServiceQuota)",
+                        format_aws_error(&e)
+                    ),
+                })?
+                .quota()
+                .and_then(|q| q.value())
+                .ok_or_else(|| Error::Aws {
+                    op: "GetServiceQuota",
+                    message: "response had no quota value".to_string(),
+                })?;
+
+            let running = self
+                .ec2
+                .describe_instances()
+                .filters(
+                    aws_sdk_ec2::types::Filter::builder()
+                        .name("instance-state-name")
+                        .values("running")
+                        .build(),
+                )
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "DescribeInstances(quota headroom)",
+                    message: format_aws_error(&e),
+                })?;
+
+            let used: u32 = running
+                .reservations()
+                .iter()
+                .flat_map(|r| r.instances())
+                .filter_map(|i| {
+                    let cpu = i.cpu_options()?;
+                    let cores = cpu.core_count()?;
+                    let threads = cpu.threads_per_core()?;
+                    Some((cores * threads).max(0) as u32)
+                })
+                .sum();
+
+            Ok((quota as u32).saturating_sub(used))
+        })
+    }
+
+    /// vCPUs of one instance of `instance_type`, via DescribeInstanceTypes.
+    pub fn vcpus_of(&self, instance_type: &str) -> Result<u32, Error> {
+        self.runtime.block_on(async {
+            let out = self
+                .ec2
+                .describe_instance_types()
+                .instance_types(aws_sdk_ec2::types::InstanceType::from(instance_type))
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "DescribeInstanceTypes",
+                    message: format!(
+                        "{} (requires ec2:DescribeInstanceTypes)",
+                        format_aws_error(&e)
+                    ),
+                })?;
+
+            out.instance_types()
+                .first()
+                .and_then(|t| t.v_cpu_info())
+                .and_then(|v| v.default_v_cpus())
+                .map(|n| n as u32)
+                .ok_or_else(|| Error::Aws {
+                    op: "DescribeInstanceTypes",
+                    message: format!("no vCPU info returned for instance type {instance_type}"),
                 })
         })
     }
