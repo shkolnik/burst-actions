@@ -5,9 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# Root: reads the root-owned 0600 /etc/burst/jitconfig and issues the
+# poweroffs; only run.sh itself drops to the unprivileged user (the runner
+# agent refuses to run as root).
 ExecStart=/opt/burst/burst-runner.sh
-User=ubuntu
-Group=ubuntu
 
 # Not enabled at bake time: started per-boot only by fleet user-data, once
 # /etc/burst/jitconfig has been written. If user-data never runs (or is

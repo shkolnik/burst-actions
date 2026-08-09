@@ -20,7 +20,7 @@ JITCONFIG="$(cat /etc/burst/jitconfig)"
 ) &
 
 cd /opt/actions-runner
-./run.sh --jitconfig "$JITCONFIG" --disableupdate 2>&1 | while IFS= read -r line; do
+runuser -u ubuntu -- ./run.sh --jitconfig "$JITCONFIG" --disableupdate 2>&1 | while IFS= read -r line; do
   echo "$line"
   case "$line" in
     *"Listening for Jobs"*)
