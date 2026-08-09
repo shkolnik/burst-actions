@@ -260,6 +260,10 @@ pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
         if let Some(w) = warning {
             eprintln!("{w}");
         }
+        if quota_leaves_nothing_to_launch(to_launch, manifest.instances.is_empty()) {
+            println!("quota headroom is zero — nothing to launch");
+            return Ok(());
+        }
 
         // 8. AMI ensure — cache hit is the common ~zero-cost case.
         let image_id = p.cloud.bake(&p.key)?;
@@ -300,17 +304,7 @@ pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
             for rec in &manifest.instances {
                 p.cloud.disarm_kill(&rec.id)?;
             }
-            match p.client.list_runners(&config.repo).and_then(|runners| {
-                for r in github::dead_registrations(&runners) {
-                    p.client.delete_runner(&config.repo, r.id, &r.name)?;
-                }
-                Ok(())
-            }) {
-                Ok(()) => {}
-                Err(e) => eprintln!(
-                    "warning: GitHub registration tidy failed (instances are already down; next sweep retries): {e}"
-                ),
-            }
+            super::sweep::tidy_dead_registrations(Ok(p.client), &config.repo);
             state.delete()?;
             println!("fleet drained — all clean");
             Ok(())
@@ -324,6 +318,14 @@ pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
 pub fn fleet_size(explicit_n: Option<u32>, auto_count: Option<u32>, max_fleet: u32) -> u32 {
     let n = explicit_n.or(auto_count).unwrap_or(0);
     n.min(max_fleet)
+}
+
+/// True when quota capped the fleet to zero AND there's no already-live
+/// fleet to watch instead — the case `run` must exit early on rather than
+/// falling through to watch (which would print the false "fleet drained —
+/// all clean" over a fleet that was never launched).
+fn quota_leaves_nothing_to_launch(to_launch: u32, manifest_instances_empty: bool) -> bool {
+    to_launch == 0 && manifest_instances_empty
 }
 
 /// Decision 9: warn BEFORE capping, never half-launch silently. Returns the
@@ -714,6 +716,22 @@ mod tests {
     fn fleet_size_zero_flows_through() {
         assert_eq!(fleet_size(None, None, 10), 0);
         assert_eq!(fleet_size(Some(0), Some(5), 10), 0);
+    }
+
+    #[test]
+    fn quota_capped_to_zero_with_no_live_fleet_is_nothing_to_launch() {
+        assert!(quota_leaves_nothing_to_launch(0, true));
+    }
+
+    #[test]
+    fn quota_capped_to_zero_with_live_fleet_is_not_nothing_to_launch() {
+        // A live fleet still needs watching — never skip on its account.
+        assert!(!quota_leaves_nothing_to_launch(0, false));
+    }
+
+    #[test]
+    fn nonzero_to_launch_is_never_nothing_to_launch() {
+        assert!(!quota_leaves_nothing_to_launch(3, true));
     }
 
     #[test]
