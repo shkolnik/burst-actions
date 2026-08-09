@@ -1,5 +1,6 @@
 use crate::error::Error;
 use crate::schema::RepoId;
+use chrono::Utc;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -165,6 +166,17 @@ pub fn count_queued_burst_jobs(jobs_response: &serde_json::Value) -> u32 {
         .unwrap_or(0)
 }
 
+/// Runs still able to hold queued jobs: everything not completed. The list
+/// endpoint's own `status` field is trustworthy (unlike its `status=`
+/// query filter — see `queued_run_ids`); a missing/garbled status is kept
+/// as a candidate, costing one jobs call rather than a silent undercount.
+pub fn run_ids_with_queue_potential(runs: &[serde_json::Value]) -> Vec<u64> {
+    runs.iter()
+        .filter(|r| r["status"].as_str() != Some("completed"))
+        .filter_map(|r| r.get("id").and_then(|v| v.as_u64()))
+        .collect()
+}
+
 /// Invariant 5. Hard error unless the policy is AllExternalContributors.
 /// There is deliberately no bypass parameter — the signature cannot express
 /// "skip the check".
@@ -317,21 +329,32 @@ impl Client {
         parse_approval_policy(value)
     }
 
-    /// Ids of queued workflow runs:
-    /// GET /repos/{o}/{r}/actions/runs?status=queued&per_page=100, paginated
+    /// Ids of workflow runs that could still hold queued jobs:
+    /// GET /repos/{o}/{r}/actions/runs?created=>=…&per_page=100, paginated
     /// to exhaustion (the loop stops once a page returns fewer than
-    /// `per_page` results).
+    /// `per_page` results), filtered client-side to `status != completed`.
+    ///
+    /// Deliberately NOT the server-side `status=queued` filter: a run whose
+    /// GitHub-hosted setup job finished while its self-hosted jobs still
+    /// queue reports `"status": "queued"` when fetched directly, yet is
+    /// absent from every `status=` filtered listing (observed live
+    /// 2026-08-09; the filter index never re-files a run that left
+    /// in_progress). The `created` window bounds the unfiltered scan:
+    /// GitHub fails any self-hosted job queued longer than 24 h, so a run
+    /// created more than 2 days ago cannot contribute queued jobs.
     pub fn queued_run_ids(&self, repo: &RepoId) -> Result<Vec<u64>, Error> {
-        const OP: &str = "GET .../actions/runs?status=queued";
+        const OP: &str = "GET .../actions/runs?created=...";
         const PER_PAGE: usize = 100;
+        let since = (Utc::now() - chrono::Duration::days(2)).format("%Y-%m-%dT%H:%M:%SZ");
         let mut ids = Vec::new();
         let mut page = 1;
         loop {
             let url = format!(
-                "{}/repos/{}/{}/actions/runs?status=queued&per_page={}&page={}",
+                "{}/repos/{}/{}/actions/runs?created=%3E%3D{}&per_page={}&page={}",
                 self.base_url,
                 repo.owner(),
                 repo.name(),
+                since,
                 PER_PAGE,
                 page
             );
@@ -353,11 +376,7 @@ impl Client {
                     message: "response missing workflow_runs".to_string(),
                 })?;
             let page_len = runs.len();
-            for run in runs {
-                if let Some(id) = run.get("id").and_then(|v| v.as_u64()) {
-                    ids.push(id);
-                }
-            }
+            ids.extend(run_ids_with_queue_potential(runs));
             if page_len < PER_PAGE {
                 break;
             }
@@ -681,6 +700,22 @@ mod tests {
     fn count_queued_burst_jobs_zero_on_empty_jobs_array() {
         let jobs = serde_json::json!({"jobs": []});
         assert_eq!(count_queued_burst_jobs(&jobs), 0);
+    }
+
+    /// Regression for the G5/G9 live finding (2026-08-09): a run whose
+    /// GitHub-hosted setup job finished while self-hosted jobs still queue
+    /// has `"status": "queued"` in the run object but is invisible to the
+    /// server-side `status=queued` filter. Run selection must therefore be
+    /// client-side: keep everything not completed.
+    #[test]
+    fn run_selection_keeps_any_non_completed_run() {
+        let runs = [
+            serde_json::json!({"id": 1, "status": "queued"}),
+            serde_json::json!({"id": 2, "status": "in_progress"}),
+            serde_json::json!({"id": 3, "status": "completed"}),
+            serde_json::json!({"id": 4}),
+        ];
+        assert_eq!(run_ids_with_queue_potential(&runs), vec![1, 2, 4]);
     }
 
     #[test]
