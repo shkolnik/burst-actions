@@ -4,4 +4,5 @@
 
 pub mod bake;
 pub mod image;
+pub mod status;
 pub mod sweep;

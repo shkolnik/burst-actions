@@ -39,10 +39,34 @@ fn up_n_and_auto_conflict() {
 #[test]
 fn subcommands_fail_loud_not_silent() {
     burst()
-        .args(["status", "--repo", "octo/widgets"])
+        .args(["down", "--repo", "octo/widgets"])
         .assert()
         .code(1)
         .stderr(predicate::str::contains("not implemented yet"));
+}
+
+#[test]
+fn status_fails_loud_offline_not_silently() {
+    // Status never calls GitHub, so (unlike bake/sweep) env_remove-ing
+    // GitHub credentials can't force an early, network-free failure — and
+    // this host's ~/.aws/credentials carries real AWS keys, so merely
+    // removing the AWS_* env vars still resolves credentials via that file.
+    // Point the SDK's config/credentials files at nowhere and strip every
+    // region source instead: region resolution fails locally, before any
+    // network call, giving a fast, no-real-AWS-touched, fail-loud check.
+    burst()
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_PROFILE")
+        .env_remove("AWS_REGION")
+        .env_remove("AWS_DEFAULT_REGION")
+        .env("AWS_CONFIG_FILE", "/nonexistent/config")
+        .env("AWS_SHARED_CREDENTIALS_FILE", "/nonexistent/credentials")
+        .args(["status", "--repo", "octo/widgets"])
+        .assert()
+        .code(1)
+        .stderr(predicate::str::contains("error:"));
 }
 
 #[test]

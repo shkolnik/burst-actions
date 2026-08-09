@@ -81,7 +81,13 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
-        Cmd::Status => not_implemented("status"),
+        Cmd::Status => match burst::commands::status::run(&config) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        },
         Cmd::Down { .. } => not_implemented("down"),
         Cmd::Sweep => match burst::commands::sweep::run(&config) {
             Ok(()) => ExitCode::SUCCESS,
