@@ -88,6 +88,24 @@ pub fn parse_approval_policy(s: &str) -> Result<ForkApprovalPolicy, Error> {
     }
 }
 
+/// Count jobs in a run's jobs payload that are queued AND labeled for burst
+/// (labels contain "burst"). Pure over the API's JSON shape.
+pub fn count_queued_burst_jobs(jobs_response: &serde_json::Value) -> u32 {
+    jobs_response["jobs"]
+        .as_array()
+        .map(|jobs| {
+            jobs.iter()
+                .filter(|j| j["status"].as_str() == Some("queued"))
+                .filter(|j| {
+                    j["labels"]
+                        .as_array()
+                        .is_some_and(|ls| ls.iter().any(|l| l.as_str() == Some("burst")))
+                })
+                .count() as u32
+        })
+        .unwrap_or(0)
+}
+
 /// Invariant 5. Hard error unless the policy is AllExternalContributors.
 /// There is deliberately no bypass parameter — the signature cannot express
 /// "skip the check".
@@ -239,11 +257,129 @@ impl Client {
             })?;
         parse_approval_policy(value)
     }
+
+    /// Ids of queued workflow runs:
+    /// GET /repos/{o}/{r}/actions/runs?status=queued&per_page=100, paginated
+    /// to exhaustion (follow `total_count` vs page size).
+    pub fn queued_run_ids(&self, repo: &RepoId) -> Result<Vec<u64>, Error> {
+        const OP: &str = "GET .../actions/runs?status=queued";
+        const PER_PAGE: usize = 100;
+        let mut ids = Vec::new();
+        let mut page = 1;
+        loop {
+            let url = format!(
+                "{}/repos/{}/{}/actions/runs?status=queued&per_page={}&page={}",
+                self.base_url,
+                repo.owner(),
+                repo.name(),
+                PER_PAGE,
+                page
+            );
+            let resp = ureq::get(url)
+                .header("Authorization", format!("Bearer {}", self.token.as_str()))
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "burst")
+                .config()
+                .http_status_as_error(false)
+                .build()
+                .call();
+            let body = Self::read_ok_json(OP, resp)?;
+            let runs = body
+                .get("workflow_runs")
+                .and_then(|v| v.as_array())
+                .ok_or_else(|| Error::GitHub {
+                    op: OP,
+                    status: 200,
+                    message: "response missing workflow_runs".to_string(),
+                })?;
+            let page_len = runs.len();
+            for run in runs {
+                if let Some(id) = run.get("id").and_then(|v| v.as_u64()) {
+                    ids.push(id);
+                }
+            }
+            if page_len < PER_PAGE {
+                break;
+            }
+            page += 1;
+        }
+        Ok(ids)
+    }
+
+    /// The --auto fleet-size input: sum of count_queued_burst_jobs over
+    /// GET /repos/{o}/{r}/actions/runs/{id}/jobs?per_page=100 for each
+    /// queued run — one call per run, by API design.
+    pub fn queued_burst_job_count(&self, repo: &RepoId) -> Result<u32, Error> {
+        const OP: &str = "GET .../actions/runs/{id}/jobs";
+        let mut total = 0;
+        for run_id in self.queued_run_ids(repo)? {
+            let url = format!(
+                "{}/repos/{}/{}/actions/runs/{}/jobs?per_page=100",
+                self.base_url,
+                repo.owner(),
+                repo.name(),
+                run_id
+            );
+            let resp = ureq::get(url)
+                .header("Authorization", format!("Bearer {}", self.token.as_str()))
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .header("User-Agent", "burst")
+                .config()
+                .http_status_as_error(false)
+                .build()
+                .call();
+            let body = Self::read_ok_json(OP, resp)?;
+            total += count_queued_burst_jobs(&body);
+        }
+        Ok(total)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn count_queued_burst_jobs_counts_queued_job_labeled_burst() {
+        let jobs = serde_json::json!({
+            "jobs": [
+                {"status": "queued", "labels": ["self-hosted", "burst"]}
+            ]
+        });
+        assert_eq!(count_queued_burst_jobs(&jobs), 1);
+    }
+
+    #[test]
+    fn count_queued_burst_jobs_excludes_in_progress_job_with_label() {
+        let jobs = serde_json::json!({
+            "jobs": [
+                {"status": "in_progress", "labels": ["self-hosted", "burst"]}
+            ]
+        });
+        assert_eq!(count_queued_burst_jobs(&jobs), 0);
+    }
+
+    #[test]
+    fn count_queued_burst_jobs_excludes_queued_job_without_burst_label() {
+        let jobs = serde_json::json!({
+            "jobs": [
+                {"status": "queued", "labels": ["self-hosted", "home"]}
+            ]
+        });
+        assert_eq!(count_queued_burst_jobs(&jobs), 0);
+    }
+
+    #[test]
+    fn count_queued_burst_jobs_zero_on_missing_jobs_array() {
+        let jobs = serde_json::json!({});
+        assert_eq!(count_queued_burst_jobs(&jobs), 0);
+    }
+
+    #[test]
+    fn count_queued_burst_jobs_zero_on_empty_jobs_array() {
+        let jobs = serde_json::json!({"jobs": []});
+        assert_eq!(count_queued_burst_jobs(&jobs), 0);
+    }
 
     #[test]
     fn jit_request_body_has_exact_shape() {
