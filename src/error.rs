@@ -51,7 +51,7 @@ pub enum Error {
     )]
     NoDefaultVpc { region: String },
     #[error(
-        "bake timed out: builder {instance_id} did not reach 'stopped' within {minutes} min — provisioning likely failed; the builder was terminated and its kill schedule deleted"
+        "bake timed out: builder {instance_id} did not reach 'stopped' within {minutes} min — provisioning likely failed"
     )]
     BakeTimeout { instance_id: String, minutes: u64 },
     #[error(

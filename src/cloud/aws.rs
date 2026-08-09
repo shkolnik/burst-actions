@@ -228,10 +228,12 @@ impl AwsContext {
                 .collect();
             by_az.sort_by_key(|(az, _)| az.to_string());
 
-            let subnet_id = by_az
-                .first()
-                .map(|(_, id)| id.to_string())
-                .ok_or(Error::NoDefaultVpc { region })?;
+            let subnet_id = by_az.first().map(|(_, id)| id.to_string()).ok_or_else(|| {
+                Error::NoDefaultSubnet {
+                    region,
+                    vpc_id: vpc_id.clone(),
+                }
+            })?;
 
             Ok((vpc_id, subnet_id))
         })
@@ -604,18 +606,20 @@ impl AwsContext {
                     message: format_aws_error(&e),
                 })?;
 
-            let mut images: Vec<(&str, &str)> = out
+            let images: Vec<(String, String, String)> = out
                 .images()
                 .iter()
-                .filter_map(|i| Some((i.image_id()?, i.creation_date()?)))
+                .filter_map(|i| {
+                    Some((
+                        i.image_id()?.to_string(),
+                        i.creation_date()?.to_string(),
+                        i.name().unwrap_or_default().to_string(),
+                    ))
+                })
                 .collect();
-            // Newest first: creation_date is ISO8601, so lexicographic order
-            // is chronological order.
-            images.sort_by(|a, b| b.1.cmp(a.1));
 
-            images
-                .first()
-                .map(|(id, _)| id.to_string())
+            pick_latest_debian(&images)
+                .cloned()
                 .ok_or_else(|| Error::Aws {
                     op: "DescribeImages(debian)",
                     message: format!(
@@ -624,6 +628,19 @@ impl AwsContext {
                 })
         })
     }
+}
+
+/// Pick the newest official (non-daily) image: excludes any name containing
+/// "daily", then newest creation date (ISO8601, so lexicographic order is
+/// chronological).
+pub(crate) fn pick_latest_debian(
+    images: &[(String, String, String)], // (image_id, creation_date, name)
+) -> Option<&String> {
+    images
+        .iter()
+        .filter(|(_, _, name)| !name.contains("daily"))
+        .max_by(|a, b| a.1.cmp(&b.1))
+        .map(|(id, _, _)| id)
 }
 
 /// True for the transient invalid-instance-profile error RunInstances returns
@@ -1120,11 +1137,14 @@ impl Cloud for AwsCloud {
         let image_id = match self.build_image_from_builder(&builder_id, key) {
             Ok(id) => id,
             Err(err) => {
-                return Err(builder_cleanup_error(
-                    self.terminate(std::slice::from_ref(&builder_id)),
-                    &builder_id,
-                    err,
-                ));
+                let terminate_result = self.terminate(std::slice::from_ref(&builder_id));
+                // Best-effort: if terminate itself failed, there's nothing
+                // to disarm yet (the schedule is the backstop); only clean
+                // up the schedule once the builder is actually gone.
+                if terminate_result.is_ok() {
+                    let _ = self.disarm_kill(&builder_id);
+                }
+                return Err(builder_cleanup_error(terminate_result, &builder_id, err));
             }
         };
 
@@ -1136,7 +1156,7 @@ impl Cloud for AwsCloud {
         Ok(image_id)
     }
 
-    /// Best-effort-but-checked delete of a builder's kill schedule: already
+    /// Best-effort-but-checked delete of an instance's kill schedule: already
     /// gone (fired, or never armed) is not an error.
     fn disarm_kill(&mut self, instance_id: &str) -> Result<(), Error> {
         self.ctx.runtime.block_on(async {
@@ -1429,18 +1449,17 @@ impl AwsCloud {
     }
 
     /// Poll until the builder reaches `Stopped` (provisioning succeeded, or
-    /// the bootstrap-deadline timer powered it off on failure). Past the
-    /// deadline: terminate (tag-verified) and delete the kill schedule
-    /// first — exactly what the timeout error promises — then fail loud.
-    fn wait_for_stopped(&mut self, builder_id: &str) -> Result<(), Error> {
+    /// the bootstrap-deadline timer powered it off on failure). Observes
+    /// only — never terminates or disarms; `bake`'s single error arm
+    /// (via `builder_cleanup_error`) is the one cleanup site for a timeout,
+    /// same as for any other failure between launch and a finished image.
+    fn wait_for_stopped(&self, builder_id: &str) -> Result<(), Error> {
         let deadline = std::time::Instant::now() + Duration::from_secs(STOP_TIMEOUT_MINUTES * 60);
         loop {
             if self.describe_instance_state(builder_id)? == InstanceState::Stopped {
                 return Ok(());
             }
             if std::time::Instant::now() >= deadline {
-                self.terminate(&[builder_id.to_string()])?;
-                self.disarm_kill(builder_id)?;
                 return Err(Error::BakeTimeout {
                     instance_id: builder_id.to_string(),
                     minutes: STOP_TIMEOUT_MINUTES,
@@ -1972,6 +1991,53 @@ mod tests {
     #[test]
     fn instance_id_from_schedule_name_rejects_missing_prefix() {
         assert_eq!(instance_id_from_schedule_name("other-i-0abc"), None);
+    }
+
+    #[test]
+    fn pick_latest_debian_skips_a_newer_daily_in_favor_of_an_older_release() {
+        let images = vec![
+            (
+                "ami-release".to_string(),
+                "2026-08-01T00:00:00.000Z".to_string(),
+                "debian-13-amd64-20260801-1".to_string(),
+            ),
+            (
+                "ami-daily".to_string(),
+                "2026-08-08T00:00:00.000Z".to_string(),
+                "debian-13-amd64-daily-20260808-1".to_string(),
+            ),
+        ];
+        assert_eq!(
+            pick_latest_debian(&images),
+            Some(&"ami-release".to_string())
+        );
+    }
+
+    #[test]
+    fn pick_latest_debian_is_none_when_only_dailies_exist() {
+        let images = vec![(
+            "ami-daily".to_string(),
+            "2026-08-08T00:00:00.000Z".to_string(),
+            "debian-13-amd64-daily-20260808-1".to_string(),
+        )];
+        assert_eq!(pick_latest_debian(&images), None);
+    }
+
+    #[test]
+    fn pick_latest_debian_picks_lexicographically_newest_date_among_releases() {
+        let images = vec![
+            (
+                "ami-old".to_string(),
+                "2026-07-01T00:00:00.000Z".to_string(),
+                "debian-13-amd64-20260701-1".to_string(),
+            ),
+            (
+                "ami-new".to_string(),
+                "2026-08-01T00:00:00.000Z".to_string(),
+                "debian-13-amd64-20260801-1".to_string(),
+            ),
+        ];
+        assert_eq!(pick_latest_debian(&images), Some(&"ami-new".to_string()));
     }
 
     #[test]
