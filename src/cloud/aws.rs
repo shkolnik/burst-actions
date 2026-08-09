@@ -52,7 +52,6 @@ fn format_aws_error<E: std::error::Error + 'static>(err: &E) -> String {
 pub struct AwsContext {
     runtime: tokio::runtime::Runtime,
     ec2: aws_sdk_ec2::Client,
-    #[allow(dead_code)] // wired up by later tasks (arm_kill)
     scheduler: aws_sdk_scheduler::Client,
     iam: aws_sdk_iam::Client,
     budgets: aws_sdk_budgets::Client,
@@ -567,6 +566,16 @@ pub(crate) fn is_iam_propagation_error(code: &str, message: &str) -> bool {
     code == "InvalidParameterValue" && message.contains("Invalid IAM Instance Profile")
 }
 
+/// Schedule name for an instance's one-shot kill: burst-actions-<instance-id>.
+pub(crate) fn kill_schedule_name(instance_id: &str) -> String {
+    format!("burst-actions-{instance_id}")
+}
+
+/// EventBridge Scheduler one-shot expression: at(yyyy-mm-ddThh:mm:ss), UTC, no zone suffix.
+pub(crate) fn at_expression(at: DateTime<Utc>) -> String {
+    format!("at({})", at.format("%Y-%m-%dT%H:%M:%S"))
+}
+
 /// Bounded backoff for the IAM-propagation retry: 6 delays summing to ~60s.
 pub(crate) fn retry_delays() -> impl Iterator<Item = Duration> {
     [2u64, 4, 8, 15, 15, 15]
@@ -850,10 +859,80 @@ impl Cloud for AwsCloud {
         })
     }
 
-    fn arm_kill(&mut self, _instance_id: &str, _at: DateTime<Utc>) -> Result<(), Error> {
-        Err(Error::Aws {
-            op: "arm_kill",
-            message: "not implemented until task 6/8".to_string(),
+    fn arm_kill(&mut self, instance_id: &str, at: DateTime<Utc>) -> Result<(), Error> {
+        let input = serde_json::to_string(&serde_json::json!({ "InstanceIds": [instance_id] }))
+            .expect("static shape always serializes");
+
+        self.ctx.runtime.block_on(async {
+            let mut delays = retry_delays();
+            loop {
+                let target = aws_sdk_scheduler::types::Target::builder()
+                    .arn("arn:aws:scheduler:::aws-sdk:ec2:terminateInstances")
+                    .role_arn(&self.substrate.scheduler_role_arn)
+                    .input(input.clone())
+                    .build()
+                    .map_err(|e| Error::Aws {
+                        op: "CreateSchedule",
+                        message: format_aws_error(&e),
+                    })?;
+
+                let flexible_time_window = aws_sdk_scheduler::types::FlexibleTimeWindow::builder()
+                    .mode(aws_sdk_scheduler::types::FlexibleTimeWindowMode::Off)
+                    .build()
+                    .map_err(|e| Error::Aws {
+                        op: "CreateSchedule",
+                        message: format_aws_error(&e),
+                    })?;
+
+                let result = self
+                    .ctx
+                    .scheduler
+                    .create_schedule()
+                    .name(kill_schedule_name(instance_id))
+                    .group_name("default")
+                    .schedule_expression(at_expression(at))
+                    .schedule_expression_timezone("UTC")
+                    .flexible_time_window(flexible_time_window)
+                    .action_after_completion(aws_sdk_scheduler::types::ActionAfterCompletion::Delete)
+                    .target(target)
+                    .send()
+                    .await;
+
+                match result {
+                    Ok(_) => return Ok(()),
+                    // Schedule already exists — arming is idempotent per instance.
+                    Err(e)
+                        if e.as_service_error()
+                            .is_some_and(|s| s.is_conflict_exception()) =>
+                    {
+                        return Ok(());
+                    }
+                    Err(e)
+                        if e.as_service_error().is_some_and(|s| {
+                            s.is_validation_exception()
+                                && s.message().unwrap_or_default().contains("assume")
+                        }) =>
+                    {
+                        if let Some(delay) = delays.next() {
+                            tokio::time::sleep(delay).await;
+                            continue;
+                        }
+                        return Err(Error::Aws {
+                            op: "CreateSchedule",
+                            message: format!(
+                                "scheduler role propagation did not settle after 60s — retry `burst up` ({})",
+                                format_aws_error(&e)
+                            ),
+                        });
+                    }
+                    Err(e) => {
+                        return Err(Error::Aws {
+                            op: "CreateSchedule",
+                            message: format_aws_error(&e),
+                        });
+                    }
+                }
+            }
         })
     }
 
@@ -1021,6 +1100,27 @@ mod tests {
             "InvalidParameterValue",
             "some other message"
         ));
+    }
+
+    #[test]
+    fn kill_schedule_name_is_prefixed_by_instance_id() {
+        assert_eq!(kill_schedule_name("i-0abc"), "burst-actions-i-0abc");
+    }
+
+    #[test]
+    fn at_expression_has_no_zone_suffix() {
+        let at = DateTime::parse_from_rfc3339("2026-08-08T18:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        assert_eq!(at_expression(at), "at(2026-08-08T18:00:00)");
+    }
+
+    #[test]
+    fn kill_target_input_round_trips() {
+        let input =
+            serde_json::to_string(&serde_json::json!({ "InstanceIds": ["i-0abc"] })).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&input).unwrap();
+        assert_eq!(value, serde_json::json!({ "InstanceIds": ["i-0abc"] }));
     }
 
     #[test]
