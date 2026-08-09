@@ -3,3 +3,4 @@
 //! testable offline.
 
 pub mod bake;
+pub mod image;
