@@ -1,0 +1,9 @@
+[Unit]
+Description=burst bootstrap deadline check
+
+[Service]
+Type=oneshot
+# Registered-or-die: if the runner never reached "Listening for Jobs" within
+# the deadline (garbage/absent JIT config, broken user-data, ...), power off.
+# Independent of the CLI or watcher being alive — invariant 3 in miniature.
+ExecStart=/bin/sh -c '[ -f /run/burst/registered ] || systemctl poweroff'

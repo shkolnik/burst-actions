@@ -1,0 +1,62 @@
+#!/usr/bin/env bash
+# Bake-time provisioning script — runs once on the builder instance, then the
+# instance is stopped and snapshotted into the AMI. Rendered by
+# payload::render_provision(); the rendered bytes are the provisioning_script
+# image-key input, so any change here (or to a substituted timeout) forces a
+# rebake rather than silently drifting from the running AMI.
+set -euo pipefail
+
+export DEBIAN_FRONTEND=noninteractive
+
+apt-get update
+apt-get install -y \
+    build-essential curl git jq unzip \
+    chromium-browser firefox xvfb \
+    libnss3 libatk-bridge2.0-0 libgtk-3-0 libgbm1 libasound2
+
+# rustup for the ubuntu user (build tooling available to jobs that need it).
+sudo -u ubuntu -H sh -c 'curl --proto "=https" --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y'
+
+# GitHub Actions runner, pinned to the version resolved at bake time.
+mkdir -p /opt/actions-runner
+cd /opt/actions-runner
+curl -fsSL -o actions-runner.tar.gz \
+    "https://github.com/actions/runner/releases/download/v__BURST_AGENT_VERSION__/actions-runner-linux-x64-__BURST_AGENT_VERSION__.tar.gz"
+tar xzf actions-runner.tar.gz
+rm actions-runner.tar.gz
+chown -R ubuntu:ubuntu /opt/actions-runner
+./bin/installdependencies.sh
+
+mkdir -p /etc/burst /opt/burst /run/burst
+
+install -m 0755 -o root -g root /dev/stdin /opt/burst/burst-runner.sh <<'BURST_RUNNER_SH'
+__BURST_RUNNER_SH__
+BURST_RUNNER_SH
+
+install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/burst-runner.service <<'BURST_RUNNER_SERVICE'
+__BURST_RUNNER_SERVICE__
+BURST_RUNNER_SERVICE
+
+install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/burst-bootstrap-deadline.timer <<'BURST_BOOTSTRAP_TIMER'
+__BURST_BOOTSTRAP_TIMER__
+BURST_BOOTSTRAP_TIMER
+
+install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/burst-bootstrap-deadline.service <<'BURST_BOOTSTRAP_SERVICE'
+__BURST_BOOTSTRAP_SERVICE__
+BURST_BOOTSTRAP_SERVICE
+
+install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/burst-ttl.timer <<'BURST_TTL_TIMER'
+__BURST_TTL_TIMER__
+BURST_TTL_TIMER
+
+install -m 0644 -o root -g root /dev/stdin /etc/systemd/system/burst-ttl.service <<'BURST_TTL_SERVICE'
+__BURST_TTL_SERVICE__
+BURST_TTL_SERVICE
+
+systemctl daemon-reload
+# Timers are enabled at bake and arm at every boot regardless of user-data;
+# burst-runner.service is deliberately NOT enabled here — it is started
+# per-boot only by fleet user-data, after /etc/burst/jitconfig exists.
+systemctl enable burst-bootstrap-deadline.timer burst-ttl.timer
+
+echo "burst provisioning complete"

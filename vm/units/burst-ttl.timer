@@ -1,0 +1,9 @@
+[Unit]
+Description=burst hard TTL — unconditional poweroff cap
+
+[Timer]
+OnBootSec=__BURST_TTL_HOURS__h
+AccuracySec=1min
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,9 @@
+[Unit]
+Description=burst bootstrap deadline — poweroff if the runner never registered
+
+[Timer]
+OnBootSec=10min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target

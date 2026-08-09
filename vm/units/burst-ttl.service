@@ -1,0 +1,8 @@
+[Unit]
+Description=burst hard TTL cap
+
+[Service]
+Type=oneshot
+# Unconditional: fires no matter what state the runner/job is in. The hard
+# cap that bounds worst-case billing even if every other cleanup layer fails.
+ExecStart=/usr/bin/systemctl poweroff

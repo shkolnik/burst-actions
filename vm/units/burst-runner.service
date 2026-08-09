@@ -1,0 +1,17 @@
+[Unit]
+Description=burst one-job GitHub Actions runner
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/opt/burst/burst-runner.sh
+User=ubuntu
+Group=ubuntu
+
+# Not enabled at bake time: started per-boot only by fleet user-data, once
+# /etc/burst/jitconfig has been written. If user-data never runs (or is
+# broken), this unit never starts and the bootstrap-deadline timer powers
+# the instance off instead.
+[Install]
+WantedBy=multi-user.target
