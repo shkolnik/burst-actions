@@ -168,8 +168,8 @@ a credential on a VM beyond the JIT config. Frame such items as options + a lean
 
 ## Housekeeping
 
-- This directory is a local git repo (identity `shkolnik-beep` configured repo-locally); there is
-  no remote yet — James will set up the GitHub server side; push when it exists. License is
+- This directory is a git repo (identity `shkolnik-beep` configured repo-locally); remote is
+  `github.com:shkolnik/burst-actions` — releases and branches are pushed there. License is
   decided: **AGPL-3.0-only** (James, 2026-08-08 — maximal-control OSI license; he is sole
   copyright holder and can relicense later; revisit CLA/DCO if outside contributors appear).
 - Phases 0–4 (`implementation-phases.md`) are complete; per-phase task plans and findings live in

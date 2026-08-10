@@ -41,7 +41,7 @@ operator runs (`task-6-data.md`) unless marked inferred.
   requiring a change (data has no t3.micro calibration comparison for this workload).
 - **volume**: hold. No disk pressure reported.
 - **idle_timeout_min=10**: hold. Never fired — job pickup was ~1min, well inside the window.
-- **ttl_hours=3**: hold. Never fired — jobs ran ~10min.
+- **ttl_hours** (shipped default 6; this run used an override of 3): hold. Never fired even at 3 — jobs ran ~10min.
 - **max_fleet**: hold on the setting itself, but see quota preflight below — the account's vCPU
   quota (32), not `max_fleet`, was the binding constraint this run.
 - **quota preflight**: challenged. `--auto` assumed quota headroom until launch time; the cap was
@@ -56,7 +56,7 @@ operator runs (`task-6-data.md`) unless marked inferred.
 
 ## sccache go/no-go input
 
-Measured fixed per-instance overhead: ~55s + $0.006. The phase-4 benchmark is a browser workload,
+Fixed per-instance overhead: ~55s (measured) + ≈$0.006 (inferred from that latency). The phase-4 benchmark is a browser workload,
 not a compile, so it doesn't exercise sccache's use case directly. Arithmetic: for a job whose
 cold `cargo build` dominates, ~55s of fixed overhead is small relative to a multi-minute build,
 and the $0.006/instance cost is negligible against burst's own economics. sccache (S3 backend)
