@@ -1,7 +1,8 @@
 # CLAUDE.md — burst-actions project guide
 
-> **Fresh session: read this file, then `design-proposal.md` in full.** Those two reconstruct the
-> project. `research/` is background only — the proposal supersedes it wherever they disagree.
+> **Fresh session: read this file, then `docs/phase-4-findings.md`.** For design rationale and the
+> decision log, read `design-proposal.md`. `research/` is background only — the proposal
+> supersedes it wherever they disagree.
 
 ## What this project is
 
@@ -21,15 +22,45 @@ team.
 
 ## Status and your job
 
-Design **approved 2026-08-08**; nothing built. Your job is the rollout plan (`design-proposal.md`
-§7): scaffold the crate, then `burst bake` v1 + `ensure_substrate()`, then
-`up`/`down`/`status`/`sweep` v1 with deliberate kill-testing of every cleanup layer, then a first
-real burst measured against a serial baseline.
+Built and released: **v0.1.0**, phases 0–4 complete. Phase 4 measured a real burst — 2.68x
+speedup at essentially equal cost to serial — see `docs/phase-4-findings.md` for the numbers and
+the §8-default calls it settled or left open. Prebuilt binary `burst-linux-x86_64` is attached to
+the v0.1.0 release.
+
+Your job now is incremental: fix findings, tune §8 defaults per real usage, extend coverage —
+against the working tool, not a rollout plan. Quickstart below gets a fresh agent to a running
+`burst` fast.
 
 **The decision log (§6) is settled — do not re-litigate it.** Ten decisions, all James's. If
-implementation reveals a decision is genuinely wrong, that's a finding to bring to him with
+using the tool reveals a decision is genuinely wrong, that's a finding to bring to him with
 evidence and options, never a thing to silently redesign around. §8's defaults are the opposite:
-**implement as written without asking**; they're expected to be tuned after first contact.
+**implement as written without asking**; they're expected to be tuned after first contact — phase
+4's findings are the first round of that tuning.
+
+## Quickstart
+
+```
+export BURST_GITHUB_TOKEN=<fine-grained PAT, Administration read/write on the target repo>
+# AWS credentials: standard env vars / profile / SSO, whatever your shell already uses
+```
+
+`burst.toml` in the repo you're bursting for (all keys optional except `repo`, which `--repo` can
+supply instead):
+
+```toml
+[burst]
+repo = "owner/repo"
+instance_type = "c7i.2xlarge"   # default; smallest type that exercises the path when testing
+max_fleet = 12                  # default
+idle_timeout_min = 10           # default
+ttl_hours = 6                   # default
+# region, arch, base_ami, provision, budget_alarm_usd — see src/config.rs for the full set
+```
+
+Flow: `burst bake` (builds the AMI once, cached after) → `burst up --auto` (sizes the fleet from
+queued burst-labeled jobs; `burst up N` for a fixed count) → `burst status` to watch → fleet
+self-terminates on completion → `burst sweep` reaps anything left over. `burst down` tears down
+the live fleet early.
 
 ## Hard rails
 
@@ -141,9 +172,9 @@ a credential on a VM beyond the JIT config. Frame such items as options + a lean
   no remote yet — James will set up the GitHub server side; push when it exists. License is
   decided: **AGPL-3.0-only** (James, 2026-08-08 — maximal-control OSI license; he is sole
   copyright holder and can relicense later; revisit CLA/DCO if outside contributors appear).
-- Implementation follows `implementation-phases.md` (four phases, each with a verification
-  gate); per-phase task plans live in `docs/plans/`. Execution model: subagent-driven
-  development — Sonnet/Opus subagents implement tasks by clarity/complexity, Fable leads and
-  reviews whole-branch / high-importance gates.
+- Phases 0–4 (`implementation-phases.md`) are complete; per-phase task plans and findings live in
+  `docs/plans/` and `docs/phase-4-findings.md`. Execution model: subagent-driven development —
+  Sonnet/Opus subagents implement tasks by clarity/complexity, Fable leads and reviews
+  whole-branch / high-importance gates.
 - Build: `cargo build`. Test: `cargo test`. Lint: `cargo clippy --all-targets -- -D warnings`.
   Format check: `cargo fmt --check`. Run all four before every commit.
