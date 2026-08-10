@@ -19,8 +19,10 @@ to any one repo — one invocation serves one repo; many repos use the tool.
 
 ## Quickstart
 
-Prebuilt binary: `burst-linux-x86_64` on the [v0.1.0 release](../../releases/tag/v0.1.0). Or
-build from source with `cargo build --release`.
+Prebuilt binary: `burst-linux-x86_64` on the [v0.1.0 release](../../releases/tag/v0.1.0), built
+and provenance-attested by CI (`.github/workflows/release.yml`; verify with
+`gh attestation verify burst-linux-x86_64 --repo shkolnik/burst-actions`). Or build from source
+with `cargo build --release`.
 
 ```
 export BURST_GITHUB_TOKEN=<fine-grained PAT, Administration read/write on the target repo>
