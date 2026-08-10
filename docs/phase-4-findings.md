@@ -7,12 +7,17 @@ operator runs (`task-6-data.md`) unless marked inferred.
 ## Headline
 
 - Matrix wall-clock: **1365s**. Serial wall-clock: **3656s**. Speedup: **2.68x**.
-- Cost: parallel $0.36 (busy-seconds $0.3581 equivalent + ~$0.006/instance boot/drain overhead at
-  the same rate) vs serial $0.3581 busy-seconds cost — **same cost, 2.68x faster**.
+- Cost: parallel run busy_instance_seconds=3630 × $0.357/hr ≈ **$0.360**, matching the measured
+  `cost_usd=0.36` — busy time accounts for essentially the whole cost; per-instance boot/drain
+  overhead is small enough to vanish in rounding at this scale. (Inferred, not independently
+  billed: launch-to-pickup ~54-59s × $0.357/hr ≈ $0.006/instance — see per-phase latency below.)
+  Serial cost was $0.3581 (its own busy-seconds), so parallel and serial land at essentially the
+  same cost — **same cost, 2.68x faster**.
 - The run hit a vCPU quota cap (32 vCPU account limit vs 48 requested), capping the fleet at 4 of
-  6 instances and forcing a second wave. Inferred uncapped case (6 instances, one wave): wall
-  ≈ 660s (~54-59s launch-to-pickup + ~605s job) → **≈5.5x** speedup. Not measured — quota was hit
-  every real run.
+  6 instances and forcing a second wave. James has since raised the account's vCPU quota to 64,
+  lifting the cap that shaped this run for future runs. Inferred uncapped case (6 instances, one
+  wave), not measured: wall ≈ 660s (~54-59s launch-to-pickup + ~605s job) → **≈5.5x** speedup
+  (inferred/extrapolated).
 
 ## Per-phase latency
 
@@ -20,9 +25,11 @@ operator runs (`task-6-data.md`) unless marked inferred.
   Miss-path duration not exercised this run — not measured.
 - **Launch→registered per instance**: ~54-59s (min 54s, median ~56-57s, max 59s), covering
   launch, boot, JIT registration, and job pickup on a warm AMI cache. Confirmed by a separate
-  calibration run (31342894074) showing the same shape.
-- **Job queued→started**: wave 1 (within quota) 45-59s per job. Wave 2 (waiting on quota
-  headroom freed by wave-1 drain) 758-760s — this reflects the quota wait, not per-instance
+  calibration run (31342894074) showing the same shape. (This is the same measured timestamp
+  pair as wave-1 "queued→started" below, viewed as a per-instance latency rather than a
+  per-job wait.)
+- **Job queued→started**: wave 1 (within quota) 54-59s per job (59, 59, 54, 54). Wave 2 (waiting
+  on quota headroom freed by wave-1 drain) 758-760s — this reflects the quota wait, not per-instance
   latency.
 - **Last-job-done→fleet-gone (drain)**: not captured as a discrete duration this run. Observed
   qualitatively: every VM self-terminated after exactly one job, 0 tagged instances remained
