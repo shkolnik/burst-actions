@@ -190,6 +190,18 @@ fn sweep_report(actions: &[super::sweep::SweepAction]) -> Vec<String> {
         .collect()
 }
 
+/// Runner names sweep-on-entry is entitled to tidy: every name the
+/// PRE-reconcile statefile minted. Sourcing this from the post-reconcile
+/// manifest would lose dropped records' names — and with them the only
+/// handle on their dead registrations.
+fn sweep_entry_minted(known: &StateFile) -> Vec<String> {
+    known
+        .instances
+        .iter()
+        .filter_map(|r| r.runner.clone())
+        .collect()
+}
+
 static DETACH: AtomicBool = AtomicBool::new(false);
 
 pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
@@ -209,6 +221,10 @@ pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
         instances: Vec::new(),
     };
     let known = residue.unwrap_or(empty);
+    // Collected BEFORE reconcile: a dropped record's runner name must still
+    // reach sweep-on-entry's registration tidy, or its dead registration
+    // becomes unmatchable forever once the statefile is rewritten.
+    let minted_so_far = sweep_entry_minted(&known);
     let cloud_instances = p.cloud.list_tagged(&config.repo)?;
     let r = reconcile::reconcile(&known, &cloud_instances);
     for id in &r.dropped {
@@ -243,11 +259,6 @@ pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
     // 4. Sweep-on-entry: rent paid on entry. It terminates instances — possibly
     //    ones just reported as adopted — so it reports every action, in sweep's
     //    own wording. Silence here would be a second spelling of one event.
-    let minted_so_far: Vec<String> = manifest
-        .instances
-        .iter()
-        .filter_map(|r| r.runner.clone())
-        .collect();
     for line in sweep_report(&super::sweep::sweep_with(
         &mut p.cloud,
         &p.client,
@@ -687,6 +698,27 @@ mod tests {
             );
         }
         assert!(lines[0].contains("i-aaa"));
+    }
+
+    #[test]
+    fn sweep_entry_minted_keeps_names_reconcile_would_drop() {
+        // The record's instance is dead (absent from the cloud listing), so
+        // reconcile drops it — but its runner name must still reach
+        // sweep-on-entry, or the dead registration is unmatchable forever.
+        let known = StateFile {
+            version: STATE_VERSION,
+            repo: "octo/widgets".into(),
+            instances: vec![InstanceRecord {
+                id: "i-dead".into(),
+                runner: Some("burst-deadbeef".into()),
+                launched_at: Utc::now(),
+                expires_at: Utc::now(),
+            }],
+        };
+        let r = crate::reconcile::reconcile(&known, &[]);
+        assert_eq!(r.dropped, vec!["i-dead"]);
+        assert!(r.live.is_empty());
+        assert_eq!(sweep_entry_minted(&known), vec!["burst-deadbeef"]);
     }
 
     #[test]

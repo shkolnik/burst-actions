@@ -68,10 +68,11 @@ be the right trigger to revisit.
 
 Every VM self-terminated after exactly one job (0 tagged instances after each run). Watchers were
 harness-killed twice post-launch; orphan kill schedules (1 serial + 2 wave-2) were disarmed by
-`burst sweep`. 0 leaked runner registrations. One gap seen live, recorded for James and not
-redesigned around: reconcile-on-entry dropped a dead statefile record (`i-0f1450b94ee47e9a4`)
-before sweep's registration tidy could match minted runner names; the registration check found no
-actual leak this time, but the ordering is worth James's attention.
+`burst sweep`. 0 leaked runner registrations. One gap seen live: reconcile-on-entry dropped a
+dead statefile record (`i-0f1450b94ee47e9a4`) before sweep's registration tidy could match minted
+runner names; no actual leak this time. **Fixed post-phase-4**: `up` now collects minted runner
+names from the pre-reconcile statefile (`sweep_entry_minted`), so a dropped record's registration
+stays matchable; guard test regressed-and-verified red.
 
 ## Deviations from the target scenario
 
