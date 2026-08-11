@@ -92,7 +92,11 @@ pub fn load(dir: &Path, repo_flag: Option<&str>) -> Result<Config, Error> {
         ttl_hours: nonzero("ttl_hours", table.ttl_hours, 6)?,
         arch,
         base_ami: table.base_ami,
-        provision: table.provision,
+        // Resolved against burst.toml's directory, not the process cwd — the
+        // config names a file in the repo it lives in.
+        provision: table
+            .provision
+            .map(|p| if p.is_relative() { dir.join(p) } else { p }),
         budget_alarm_usd,
     })
 }
@@ -146,6 +150,18 @@ mod tests {
         assert_eq!(c.max_fleet, 3);
         let c2 = load(d.path(), Some("octo/widgets")).unwrap();
         assert_eq!(c2.repo.to_string(), "octo/widgets");
+    }
+
+    /// `provision` names a file in the repo burst.toml lives in — a relative
+    /// path resolves against that directory, never the process cwd.
+    #[test]
+    fn provision_relative_path_resolves_against_config_dir() {
+        let d = dir_with("[burst]\nrepo = \"a/b\"\nprovision = \".burst/provision.sh\"\n");
+        let c = load(d.path(), None).unwrap();
+        assert_eq!(c.provision.unwrap(), d.path().join(".burst/provision.sh"));
+        let d2 = dir_with("[burst]\nrepo = \"a/b\"\nprovision = \"/abs/provision.sh\"\n");
+        let c2 = load(d2.path(), None).unwrap();
+        assert_eq!(c2.provision.unwrap(), PathBuf::from("/abs/provision.sh"));
     }
 
     #[test]

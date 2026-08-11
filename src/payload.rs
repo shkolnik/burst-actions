@@ -29,11 +29,18 @@ const TTL_SERVICE: &str = include_str!("../vm/units/burst-ttl.service");
 /// placeholder still present after substitution is an authoring bug in a
 /// template — reported by name rather than shipped into an AMI that would
 /// silently ignore it.
-pub fn render_provision(agent_version: &str) -> Result<String, Error> {
-    render_provision_from(PROVISION_TMPL, agent_version)
+pub fn render_provision(
+    agent_version: &str,
+    custom_provision: Option<&str>,
+) -> Result<String, Error> {
+    render_provision_from(PROVISION_TMPL, agent_version, custom_provision)
 }
 
-fn render_provision_from(tmpl: &str, agent_version: &str) -> Result<String, Error> {
+fn render_provision_from(
+    tmpl: &str,
+    agent_version: &str,
+    custom_provision: Option<&str>,
+) -> Result<String, Error> {
     let mut out = tmpl
         .replace("__BURST_RUNNER_SH__", RUNNER_SH)
         .replace("__BURST_TTL_CHECK_SH__", TTL_CHECK_SH)
@@ -56,6 +63,18 @@ fn render_provision_from(tmpl: &str, agent_version: &str) -> Result<String, Erro
                 &rest[..end]
             ),
         });
+    }
+
+    // The custom script is appended AFTER the placeholder check: it is the
+    // user's own bytes, not a template — a literal `__BURST_...__` in it is
+    // theirs to mean whatever they want. Appended bytes are part of the
+    // image-key input, so editing the custom script forces a rebake.
+    if let Some(custom) = custom_provision {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("\n# ---- custom provision (burst.toml `provision`) ----\n");
+        out.push_str(custom);
     }
 
     Ok(out)
@@ -139,21 +158,54 @@ mod tests {
 
     #[test]
     fn render_has_no_leftover_placeholders() {
-        let rendered = render_provision("2.320.0").unwrap();
+        let rendered = render_provision("2.320.0", None).unwrap();
         assert!(!rendered.contains("__BURST_"), "{rendered}");
     }
 
     #[test]
     fn render_contains_expected_values() {
-        let rendered = render_provision("2.320.0").unwrap();
+        let rendered = render_provision("2.320.0", None).unwrap();
         assert!(rendered.contains("--disableupdate"));
         assert!(rendered.contains("2.320.0"));
+    }
+
+    /// The custom script rides at the end of the rendered output — after the
+    /// runner install and timer enablement — and its bytes change the image
+    /// key, so editing it forces a rebake instead of reusing a stale AMI.
+    #[test]
+    fn custom_provision_appends_and_changes_the_image_key() {
+        let base = render_provision("2.320.0", None).unwrap();
+        let custom = render_provision("2.320.0", Some("apt-get install -y docker.io\n")).unwrap();
+        assert!(
+            custom.starts_with(&base),
+            "custom must extend, not alter, the base"
+        );
+        assert!(
+            custom.ends_with("apt-get install -y docker.io\n"),
+            "{custom}"
+        );
+        let key = |script: &str| {
+            image_key(&ImageKeyInputs {
+                provisioning_script: script.as_bytes(),
+                base_image_id: "ami-0abc",
+                arch: Arch::X86_64,
+                runner_agent_version: "2.320.0",
+            })
+        };
+        assert_ne!(key(&base), key(&custom));
+    }
+
+    /// A `__BURST_...__` string inside the user's own script is their
+    /// content, not an unsubstituted template placeholder.
+    #[test]
+    fn custom_provision_may_contain_placeholder_shaped_text() {
+        render_provision("2.320.0", Some("echo __BURST_NOT_A_PLACEHOLDER__\n")).unwrap();
     }
 
     #[test]
     fn render_errors_on_leftover_placeholder() {
         let bad_tmpl = "echo hi\n__BURST_TYPO__\n";
-        let err = render_provision_from(bad_tmpl, "2.320.0").unwrap_err();
+        let err = render_provision_from(bad_tmpl, "2.320.0", None).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("__BURST_TYPO__"), "{msg}");
     }
@@ -256,7 +308,7 @@ mod tests {
     /// verified live.
     #[test]
     fn provision_enables_both_cleanup_timers() {
-        let rendered = render_provision("2.320.0").unwrap();
+        let rendered = render_provision("2.320.0", None).unwrap();
         assert!(
             rendered.contains("systemctl enable burst-bootstrap-deadline.timer burst-ttl.timer"),
             "bake must enable the bootstrap-deadline and ttl timers"
@@ -291,7 +343,7 @@ mod tests {
     /// — the values travel in launch user-data instead.
     #[test]
     fn timeouts_do_not_appear_in_the_provisioning_script() {
-        let rendered = render_provision("2.320.0").unwrap();
+        let rendered = render_provision("2.320.0", None).unwrap();
         let key = image_key(&ImageKeyInputs {
             provisioning_script: rendered.as_bytes(),
             base_image_id: "ami-0abc",

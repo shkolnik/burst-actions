@@ -48,7 +48,19 @@ pub fn prepare(config: &Config) -> Result<Prepared, Error> {
         }
     };
 
-    let rendered = render_provision(&agent_version)?;
+    // Custom provision script (burst.toml `provision`): read every run, even
+    // on the cache-hit path — its bytes are an image-key input, so an edit
+    // must miss the cache and rebake rather than reuse a stale AMI.
+    let custom = match &config.provision {
+        Some(path) => Some(
+            std::fs::read_to_string(path).map_err(|source| Error::ConfigRead {
+                path: path.clone(),
+                source,
+            })?,
+        ),
+        None => None,
+    };
+    let rendered = render_provision(&agent_version, custom.as_deref())?;
     let key = image_key(&ImageKeyInputs {
         provisioning_script: rendered.as_bytes(),
         base_image_id: &base_ami,
