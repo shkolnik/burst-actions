@@ -187,3 +187,41 @@ fn init_writes_a_config_in_an_unconfigured_directory() {
     let written = std::fs::read_to_string(dir.path().join("burst.toml")).unwrap();
     assert!(written.contains("repo = \"octo/widgets\""), "{written}");
 }
+
+/// The help's setup banner is situational: it names only what this directory
+/// is missing, and disappears entirely once nothing is.
+#[test]
+fn help_shows_only_the_outstanding_setup_steps() {
+    let dir = tempfile::tempdir().unwrap();
+    let help = || {
+        let mut cmd = Command::cargo_bin("burst").unwrap();
+        cmd.current_dir(dir.path())
+            .env_remove("BURST_GITHUB_TOKEN")
+            .env_remove("GITHUB_TOKEN")
+            .arg("--help");
+        cmd
+    };
+
+    help()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("export BURST_GITHUB_TOKEN="))
+        .stdout(predicate::str::contains("burst init owner/repo"));
+
+    std::fs::write(dir.path().join("burst.toml"), "[burst]\nrepo = \"a/b\"\n").unwrap();
+    help()
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("export BURST_GITHUB_TOKEN="))
+        .stdout(predicate::str::contains("burst init").not());
+
+    let mut ready = Command::cargo_bin("burst").unwrap();
+    ready
+        .current_dir(dir.path())
+        .env("BURST_GITHUB_TOKEN", "ghp_notreal")
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Commands:"))
+        .stdout(predicate::str::contains("Setup:").not());
+}

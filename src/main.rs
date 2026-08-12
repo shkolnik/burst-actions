@@ -1,4 +1,4 @@
-use clap::{ArgGroup, Parser, Subcommand};
+use clap::{ArgGroup, CommandFactory, FromArgMatches, Parser, Subcommand};
 use std::process::ExitCode;
 
 #[derive(Parser)]
@@ -55,9 +55,20 @@ enum Cmd {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    // The help text is built before parsing so it can carry the setup steps
+    // this directory still needs; a directory with nothing outstanding gets
+    // the plain help.
+    let cwd = std::env::current_dir();
+    let mut command = Cli::command();
+    if let Some(setup) = cwd.as_ref().ok().and_then(|d| burst::setup::probe(d)) {
+        command = command.after_help(setup);
+    }
+    let cli = match Cli::from_arg_matches(&command.get_matches()) {
+        Ok(c) => c,
+        Err(e) => e.exit(),
+    };
 
-    let cwd = match std::env::current_dir() {
+    let cwd = match cwd {
         Ok(d) => d,
         Err(e) => {
             eprintln!("error: {e}");

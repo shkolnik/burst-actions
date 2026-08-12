@@ -7,4 +7,5 @@ pub mod github;
 pub mod payload;
 pub mod reconcile;
 pub mod schema;
+pub mod setup;
 pub mod state;
