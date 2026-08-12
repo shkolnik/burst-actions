@@ -52,12 +52,12 @@ fails if a setting exists in the code but not here).
 <summary><code>config.example.toml</code></summary>
 
 ```toml
-# burst configuration — copy to `burst.toml` in the repo you are bursting for,
-# or run `burst init owner/repo` to drop this file there with `repo` filled in.
+# burst configuration.
 #
 # `repo` is the only required setting. Every other line is commented out and
 # shows the default burst uses when you leave it that way; uncomment (drop the
-# leading `#`) to change one.
+# leading `#`) to change one. What a job can rely on from a runner is
+# documented in docs/runner-contract.md.
 
 [burst]
 # The repository whose queued jobs this fleet serves. Required; `--repo` on the
