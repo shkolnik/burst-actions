@@ -24,6 +24,7 @@ fn abandoned_run_is_adopted_and_reconciled() {
             },
             user_data: "jit".into(),
             ssh_key: None,
+            volume: burst::schema::VolumeSpec::default(),
         })
         .unwrap();
     let rs = RepoState::open_at(dir.path().to_path_buf());
@@ -60,6 +61,7 @@ fn abandoned_run_is_adopted_and_reconciled() {
             },
             user_data: "jit2".into(),
             ssh_key: None,
+            volume: burst::schema::VolumeSpec::default(),
         })
         .unwrap();
 

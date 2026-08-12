@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::schema::{RepoId, TagSpec};
+use crate::schema::{RepoId, TagSpec, VolumeSpec};
 use chrono::{DateTime, Utc};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -54,6 +54,8 @@ pub struct LaunchSpec {
     /// EC2 key-pair name for SSH access. `None` (the default) launches with
     /// no SSH key.
     pub ssh_key: Option<String>,
+    /// Root volume for every instance in this launch.
+    pub volume: VolumeSpec,
 }
 
 /// The only seam to a cloud. Sync in phase 1; phase 2 makes these async when

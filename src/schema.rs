@@ -89,6 +89,75 @@ impl Arch {
     }
 }
 
+/// The root EBS volume a burst VM launches with: gp3 always, sized by the
+/// consuming repo. `iops`/`throughput_mbps` left `None` take gp3's baseline
+/// (3000 IOPS, 125 MB/s). The volume is the *only* disk — the job workspace
+/// and the container data root both live on it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VolumeSpec {
+    pub size_gb: u32,
+    pub iops: Option<u32>,
+    pub throughput_mbps: Option<u32>,
+}
+
+/// §8.2 starting default: big enough for a checkout, a toolchain and a
+/// couple of container images; a disk-heavy repo raises `volume_gb`.
+pub const DEFAULT_VOLUME_GB: u32 = 100;
+
+impl Default for VolumeSpec {
+    fn default() -> Self {
+        Self {
+            size_gb: DEFAULT_VOLUME_GB,
+            iops: None,
+            throughput_mbps: None,
+        }
+    }
+}
+
+impl VolumeSpec {
+    /// gp3's published limits: 1-16384 GiB, 3000-16000 IOPS capped at 500
+    /// IOPS/GiB, 125-1000 MB/s capped at 0.25 MB/s per provisioned IOPS.
+    /// Checked here so a bad number fails at config load, not as an EC2 API
+    /// error after bake, preflight and JIT minting.
+    pub fn new(
+        size_gb: u32,
+        iops: Option<u32>,
+        throughput_mbps: Option<u32>,
+    ) -> Result<Self, String> {
+        if !(1..=16384).contains(&size_gb) {
+            return Err(format!("volume_gb {size_gb}: gp3 allows 1-16384"));
+        }
+        if let Some(i) = iops {
+            if !(3000..=16000).contains(&i) {
+                return Err(format!("volume_iops {i}: gp3 allows 3000-16000"));
+            }
+            if i > size_gb.saturating_mul(500) {
+                return Err(format!(
+                    "volume_iops {i}: gp3 allows at most 500 IOPS per GiB, so {size_gb} GiB caps at {}",
+                    size_gb.saturating_mul(500).min(16000)
+                ));
+            }
+        }
+        if let Some(t) = throughput_mbps {
+            if !(125..=1000).contains(&t) {
+                return Err(format!("volume_throughput_mbps {t}: gp3 allows 125-1000"));
+            }
+            let provisioned_iops = iops.unwrap_or(3000);
+            if t * 4 > provisioned_iops {
+                return Err(format!(
+                    "volume_throughput_mbps {t}: gp3 allows at most 0.25 MB/s per IOPS, so {provisioned_iops} IOPS caps at {} — raise volume_iops",
+                    provisioned_iops / 4
+                ));
+            }
+        }
+        Ok(Self {
+            size_gb,
+            iops,
+            throughput_mbps,
+        })
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct ImageKeyInputs<'a> {
     pub provisioning_script: &'a [u8],
@@ -152,6 +221,42 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn volume_spec_accepts_the_shapes_a_consumer_asks_for() {
+        assert_eq!(VolumeSpec::default().size_gb, 100);
+        let v = VolumeSpec::new(750, Some(6000), Some(1000)).unwrap();
+        assert_eq!(
+            (v.size_gb, v.iops, v.throughput_mbps),
+            (750, Some(6000), Some(1000))
+        );
+        // Baseline gp3: both performance knobs absent is the common case.
+        assert!(VolumeSpec::new(750, None, None).is_ok());
+        // 750 MB/s is the ceiling at gp3's baseline 3000 IOPS.
+        assert!(VolumeSpec::new(750, None, Some(750)).is_ok());
+    }
+
+    /// Every rejection names the offending key and its allowed range: these
+    /// land at config load, hours before the EC2 call they would otherwise
+    /// fail at.
+    #[test]
+    fn volume_spec_rejects_out_of_range_and_says_why() {
+        for (size, iops, tput, want) in [
+            (0, None, None, "volume_gb"),
+            (20000, None, None, "volume_gb"),
+            (750, Some(2999), None, "volume_iops"),
+            (750, Some(16001), None, "volume_iops"),
+            // 500 IOPS/GiB ceiling: 4 GiB caps at 2000, below the 3000 floor.
+            (10, Some(5001), None, "500 IOPS per GiB"),
+            (750, None, Some(124), "volume_throughput_mbps"),
+            (750, None, Some(1001), "volume_throughput_mbps"),
+            // 0.25 MB/s per IOPS: 1000 MB/s needs 4000 provisioned IOPS.
+            (750, None, Some(1000), "raise volume_iops"),
+        ] {
+            let e = VolumeSpec::new(size, iops, tput).unwrap_err();
+            assert!(e.contains(want), "{size}/{iops:?}/{tput:?} said {e:?}");
+        }
     }
 
     #[test]

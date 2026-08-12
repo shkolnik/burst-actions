@@ -450,6 +450,7 @@ mod tests {
             arch: crate::schema::Arch::X86_64,
             base_ami: None,
             provision: None,
+            volume: crate::schema::VolumeSpec::default(),
             budget_alarm_usd: None,
         };
         let result = run_locked(&state, &config);

@@ -119,6 +119,7 @@ mod tests {
             },
             user_data: "jit-blob".into(),
             ssh_key: None,
+            volume: crate::schema::VolumeSpec::default(),
         }
     }
 

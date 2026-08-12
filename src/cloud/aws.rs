@@ -1,6 +1,6 @@
 use super::{Cloud, Instance, InstanceState, LaunchSpec};
 use crate::error::Error;
-use crate::schema::{Arch, RepoId, TAG_BURST, TAG_IMAGE_KEY, TAG_REPO};
+use crate::schema::{Arch, RepoId, TAG_BURST, TAG_IMAGE_KEY, TAG_REPO, VolumeSpec};
 use aws_sdk_ec2::error::ProvideErrorMetadata;
 use aws_smithy_types::error::display::DisplayErrorContext;
 use base64::Engine;
@@ -632,6 +632,46 @@ impl AwsContext {
         })
     }
 
+    /// The root device of `image_id`: its device name and the size of the
+    /// snapshot behind it. Read-only `DescribeImages`, called once per
+    /// launch — the name differs by base image family and must be read, not
+    /// assumed (see `root_block_device`).
+    pub(crate) fn root_device(&self, image_id: &str) -> Result<RootDevice, Error> {
+        let missing = |what: &str| Error::Aws {
+            op: "DescribeImages(root device)",
+            message: format!("image {image_id} has no {what}"),
+        };
+        self.runtime.block_on(async {
+            let out = self
+                .ec2
+                .describe_images()
+                .image_ids(image_id)
+                .send()
+                .await
+                .map_err(|e| Error::Aws {
+                    op: "DescribeImages(root device)",
+                    message: format_aws_error(&e),
+                })?;
+            let image = out.images().first().ok_or_else(|| Error::Aws {
+                op: "DescribeImages(root device)",
+                message: format!("image {image_id} not found"),
+            })?;
+            let name = image
+                .root_device_name()
+                .ok_or_else(|| missing("root device name"))?
+                .to_string();
+            let size_gb = image
+                .block_device_mappings()
+                .iter()
+                .find(|m| m.device_name() == Some(name.as_str()))
+                .and_then(|m| m.ebs())
+                .and_then(|e| e.volume_size())
+                .ok_or_else(|| missing("EBS root device mapping"))?
+                as u32;
+            Ok(RootDevice { name, size_gb })
+        })
+    }
+
     /// vCPU headroom under the account's on-demand (L-1216C47A, "Running
     /// On-Demand Standard instances") or spot (L-34B43A08, "All Standard Spot
     /// Instance Requests") vCPU quota: quota value minus the vCPUs of
@@ -879,6 +919,60 @@ pub(crate) fn superseded<'a>(
         .collect()
 }
 
+/// Root volume of the bake builder. Fixed, not a config key: bake headroom
+/// (browsers, toolchains, whatever `provision` installs) is burst's problem,
+/// not the consuming repo's. It also sets the floor for `volume_gb`, since
+/// EC2 refuses a root volume smaller than the image it launches from.
+const BUILDER_VOLUME_GB: u32 = 30;
+
+/// The image's root device (`/dev/xvda` on Debian, `/dev/sda1` on Ubuntu)
+/// and the size of the snapshot behind it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RootDevice {
+    pub name: String,
+    pub size_gb: u32,
+}
+
+/// Root-volume override for `RunInstances`. Naming the image's *own* root
+/// device is what makes this a resize: a mismatched device name silently
+/// attaches a second, unmounted volume and leaves the job on the image's
+/// original disk.
+fn root_block_device(
+    root: &RootDevice,
+    volume: VolumeSpec,
+) -> aws_sdk_ec2::types::BlockDeviceMapping {
+    let mut ebs = aws_sdk_ec2::types::EbsBlockDevice::builder()
+        .volume_size(volume.size_gb as i32)
+        .volume_type(aws_sdk_ec2::types::VolumeType::Gp3)
+        .delete_on_termination(true);
+    if let Some(iops) = volume.iops {
+        ebs = ebs.iops(iops as i32);
+    }
+    if let Some(throughput) = volume.throughput_mbps {
+        ebs = ebs.throughput(throughput as i32);
+    }
+    aws_sdk_ec2::types::BlockDeviceMapping::builder()
+        .device_name(&root.name)
+        .ebs(ebs.build())
+        .build()
+}
+
+/// EC2 rejects a root volume smaller than the image's snapshot with an
+/// opaque `InvalidBlockDeviceMapping`; refuse first, with both numbers and
+/// the key to change.
+fn check_root_fits(volume: VolumeSpec, root: &RootDevice, image_id: &str) -> Result<(), Error> {
+    if volume.size_gb < root.size_gb {
+        return Err(Error::Environment {
+            reason: format!(
+                "volume_gb = {req} is smaller than the {root_gb} GiB root of image {image_id} — set volume_gb to at least {root_gb} in burst.toml",
+                req = volume.size_gb,
+                root_gb = root.size_gb,
+            ),
+        });
+    }
+    Ok(())
+}
+
 fn tag_specification(
     resource_type: aws_sdk_ec2::types::ResourceType,
     tags: &[(String, String)],
@@ -914,6 +1008,10 @@ impl Cloud for AwsCloud {
 
         let user_data_b64 = base64::engine::general_purpose::STANDARD.encode(&spec.user_data);
 
+        let root = self.ctx.root_device(&spec.image_id)?;
+        check_root_fits(spec.volume, &root, &spec.image_id)?;
+        let block_device = root_block_device(&root, spec.volume);
+
         self.ctx.runtime.block_on(async {
             let mut delays = retry_delays();
             loop {
@@ -940,7 +1038,8 @@ impl Cloud for AwsCloud {
                             .build(),
                     )
                     .tag_specifications(instance_tags.clone())
-                    .tag_specifications(volume_tags.clone());
+                    .tag_specifications(volume_tags.clone())
+                    .block_device_mappings(block_device.clone());
                 if let Some(m) = market_options.clone() {
                     request = request.instance_market_options(m);
                 }
@@ -1481,6 +1580,16 @@ impl AwsCloud {
         let wrapped = crate::payload::wrap_provision_for_bake(&self.provisioning_script)?;
         let user_data_b64 = base64::engine::general_purpose::STANDARD.encode(wrapped.as_bytes());
 
+        // Never shrink the base image: a base already larger than
+        // BUILDER_VOLUME_GB keeps its own size.
+        let root = self.ctx.root_device(&self.base_ami)?;
+        let builder_volume = VolumeSpec {
+            size_gb: BUILDER_VOLUME_GB.max(root.size_gb),
+            iops: None,
+            throughput_mbps: None,
+        };
+        let block_device = root_block_device(&root, builder_volume);
+
         self.ctx.runtime.block_on(async {
             let out = self
                 .ctx
@@ -1508,6 +1617,7 @@ impl AwsCloud {
                 )
                 .tag_specifications(instance_tags)
                 .tag_specifications(volume_tags)
+                .block_device_mappings(block_device.clone())
                 .send()
                 .await
                 .map_err(|e| Error::Aws {
@@ -1775,6 +1885,53 @@ impl AwsCloud {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The override must name the image's *own* root device and carry the
+    /// full gp3 spec — a wrong device name attaches a second volume and
+    /// leaves the job on the image's original disk.
+    #[test]
+    fn root_block_device_resizes_the_image_root() {
+        let root = RootDevice {
+            name: "/dev/sda1".into(),
+            size_gb: 8,
+        };
+        let m = root_block_device(&root, VolumeSpec::new(750, Some(6000), Some(1000)).unwrap());
+        assert_eq!(m.device_name(), Some("/dev/sda1"));
+        let ebs = m.ebs().expect("EBS spec");
+        assert_eq!(ebs.volume_size(), Some(750));
+        assert_eq!(ebs.iops(), Some(6000));
+        assert_eq!(ebs.throughput(), Some(1000));
+        assert_eq!(
+            ebs.volume_type(),
+            Some(&aws_sdk_ec2::types::VolumeType::Gp3)
+        );
+        assert_eq!(ebs.delete_on_termination(), Some(true));
+
+        // gp3 baseline: unset knobs are left to AWS, not guessed at.
+        let m = root_block_device(&root, VolumeSpec::new(100, None, None).unwrap());
+        let ebs = m.ebs().unwrap();
+        assert_eq!((ebs.iops(), ebs.throughput()), (None, None));
+    }
+
+    /// A root volume below the image's own root fails before RunInstances,
+    /// naming both numbers and the key to change.
+    #[test]
+    fn root_smaller_than_the_image_is_refused_with_the_remedy() {
+        let root = RootDevice {
+            name: "/dev/xvda".into(),
+            size_gb: 30,
+        };
+        let e = check_root_fits(VolumeSpec::new(20, None, None).unwrap(), &root, "ami-0abc")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            e.contains("volume_gb") && e.contains("30") && e.contains("ami-0abc"),
+            "{e}"
+        );
+        assert!(
+            check_root_fits(VolumeSpec::new(30, None, None).unwrap(), &root, "ami-0abc").is_ok()
+        );
+    }
 
     #[test]
     fn config_region_wins_over_chain() {

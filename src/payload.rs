@@ -122,6 +122,7 @@ pub fn fleet_user_data(
     jit_config: &str,
     idle_timeout_min: u32,
     ttl_hours: u32,
+    volume_gb: u32,
 ) -> Result<String, Error> {
     // The blob is embedded verbatim inside a root-executed heredoc. GitHub's
     // encoded JIT config is base64; anything outside that charset (in
@@ -143,7 +144,7 @@ pub fn fleet_user_data(
         "#!/usr/bin/env bash\n\
          set -euo pipefail\n\
          install -d -m 0755 /etc/burst\n\
-         printf 'IDLE_TIMEOUT_MIN=%s\\nTTL_HOURS=%s\\n' {idle_timeout_min} {ttl_hours} > /etc/burst/launch.env\n\
+         printf 'IDLE_TIMEOUT_MIN=%s\\nTTL_HOURS=%s\\nVOLUME_GB=%s\\n' {idle_timeout_min} {ttl_hours} {volume_gb} > /etc/burst/launch.env\n\
          install -m 0600 -o root -g root /dev/stdin /etc/burst/jitconfig <<'BURST_JITCONFIG'\n\
          {jit_config}\n\
          BURST_JITCONFIG\n\
@@ -231,7 +232,7 @@ mod tests {
         // A newline is the escape vector: it could smuggle the heredoc
         // terminator plus arbitrary root shell.
         for bad in ["evil\nBURST_JITCONFIG\npoweroff", "", "spaces in blob"] {
-            let msg = fleet_user_data(bad, 10, 6).unwrap_err().to_string();
+            let msg = fleet_user_data(bad, 10, 6, 100).unwrap_err().to_string();
             assert!(msg.contains("not a base64 blob"), "{bad:?}: {msg}");
         }
     }
@@ -250,7 +251,7 @@ mod tests {
 
     #[test]
     fn fleet_user_data_contains_jitconfig_mode_and_start() {
-        let ud = fleet_user_data("blob", 10, 6).unwrap();
+        let ud = fleet_user_data("blob", 10, 6, 100).unwrap();
         assert!(ud.contains("blob"));
         assert!(ud.contains("0600"));
         assert!(ud.contains("systemctl start burst-runner.service"));
@@ -261,10 +262,11 @@ mod tests {
     /// unit starts.
     #[test]
     fn fleet_user_data_writes_launch_env_before_runner_start() {
-        let ud = fleet_user_data("blob", 7, 3).unwrap();
+        let ud = fleet_user_data("blob", 7, 3, 250).unwrap();
         let env_pos = ud.find("/etc/burst/launch.env").expect("env file written");
         assert!(ud.contains("IDLE_TIMEOUT_MIN=%s"), "{ud}");
-        assert!(ud.contains(" 7 3 "), "values interpolated: {ud}");
+        assert!(ud.contains("VOLUME_GB=%s"), "{ud}");
+        assert!(ud.contains(" 7 3 250 "), "values interpolated: {ud}");
         let start_pos = ud.find("systemctl start burst-runner.service").unwrap();
         assert!(
             env_pos < start_pos,
@@ -281,6 +283,9 @@ mod tests {
             assert!(reader.contains(". /etc/burst/launch.env"), "{reader}");
         }
         assert!(RUNNER_SH.contains("IDLE_TIMEOUT_MIN=10"), "baked default");
+        // VOLUME_GB is written by the same printf the runner sources; a
+        // rename on either side turns the capacity check into a silent no-op.
+        assert!(RUNNER_SH.contains("VOLUME_GB=0"), "unknown-size backstop");
         assert!(TTL_CHECK_SH.contains("TTL_HOURS=6"), "baked default");
     }
 

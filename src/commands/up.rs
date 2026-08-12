@@ -9,7 +9,7 @@ use crate::config::Config;
 use crate::error::Error;
 use crate::github;
 use crate::reconcile;
-use crate::schema::{RepoId, TagSpec};
+use crate::schema::{RepoId, TagSpec, VolumeSpec};
 use crate::state::{InstanceRecord, RepoState, STATE_VERSION, StateFile};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -44,6 +44,7 @@ pub fn launch_fleet(
     expires: DateTime<Utc>,
     idle_timeout_min: u32,
     ttl_hours: u32,
+    volume: VolumeSpec,
     spot: bool,
     ssh_key: Option<&str>,
     image_id: &str,
@@ -62,8 +63,9 @@ pub fn launch_fleet(
         let nonce = github::runner_nonce();
         let name = github::runner_name(&nonce);
         let jit = mint(&name).map_err(|e| partial(launched, e))?;
-        let user_data = crate::payload::fleet_user_data(&jit, idle_timeout_min, ttl_hours)
-            .map_err(|e| partial(launched, e))?;
+        let user_data =
+            crate::payload::fleet_user_data(&jit, idle_timeout_min, ttl_hours, volume.size_gb)
+                .map_err(|e| partial(launched, e))?;
         let instances = cloud
             .launch(&LaunchSpec {
                 count: 1,
@@ -76,6 +78,7 @@ pub fn launch_fleet(
                 },
                 user_data,
                 ssh_key: ssh_key.map(str::to_string),
+                volume,
             })
             .map_err(|e| partial(launched, e))?;
         let Some(instance) = instances.into_iter().next() else {
@@ -312,6 +315,7 @@ pub fn run(config: &Config, args: &UpArgs) -> Result<(), Error> {
             expires,
             config.idle_timeout_min,
             config.ttl_hours,
+            config.volume,
             args.spot,
             args.ssh_key.as_deref(),
             &image_id,
@@ -445,6 +449,7 @@ mod tests {
             expires,
             10,
             6,
+            VolumeSpec::default(),
             false,
             None,
             "ami-x",
@@ -495,6 +500,7 @@ mod tests {
             Utc::now() + ChronoDuration::hours(6),
             10,
             6,
+            VolumeSpec::default(),
             false,
             None,
             "ami-x",
@@ -572,6 +578,7 @@ mod tests {
             Utc::now() + ChronoDuration::hours(6),
             10,
             6,
+            VolumeSpec::default(),
             false,
             None,
             "ami-x",

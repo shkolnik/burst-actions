@@ -1,5 +1,5 @@
 use crate::error::Error;
-use crate::schema::{Arch, RepoId};
+use crate::schema::{Arch, DEFAULT_VOLUME_GB, RepoId, VolumeSpec};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
 
@@ -23,6 +23,9 @@ struct BurstTable {
     base_ami: Option<String>,
     provision: Option<PathBuf>,
     budget_alarm_usd: Option<u32>,
+    volume_gb: Option<u32>,
+    volume_iops: Option<u32>,
+    volume_throughput_mbps: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -36,6 +39,8 @@ pub struct Config {
     pub arch: Arch,
     pub base_ami: Option<String>,
     pub provision: Option<PathBuf>,
+    /// Root volume every runner in the fleet launches with.
+    pub volume: VolumeSpec,
     /// Monthly AWS Budgets cost alarm in USD (design §3 layer 5). Absent
     /// means no alarm is created — this is opt-in. Suggested value: $15.
     pub budget_alarm_usd: Option<u32>,
@@ -78,6 +83,12 @@ pub fn load(dir: &Path, repo_flag: Option<&str>) -> Result<Config, Error> {
         Some(n) => Ok(n),
         None => Ok(default),
     };
+    let volume = VolumeSpec::new(
+        table.volume_gb.unwrap_or(DEFAULT_VOLUME_GB),
+        table.volume_iops,
+        table.volume_throughput_mbps,
+    )
+    .map_err(invalid)?;
     let budget_alarm_usd = match table.budget_alarm_usd {
         Some(0) => return Err(invalid("budget_alarm_usd must be at least 1".into())),
         other => other,
@@ -97,6 +108,7 @@ pub fn load(dir: &Path, repo_flag: Option<&str>) -> Result<Config, Error> {
         provision: table
             .provision
             .map(|p| if p.is_relative() { dir.join(p) } else { p }),
+        volume,
         budget_alarm_usd,
     })
 }
@@ -124,6 +136,26 @@ mod tests {
         assert_eq!(c.arch, Arch::X86_64);
         assert!(c.region.is_none() && c.base_ami.is_none() && c.provision.is_none());
         assert!(c.budget_alarm_usd.is_none());
+    }
+
+    #[test]
+    fn volume_keys_load_and_default() {
+        let d = dir_with("[burst]\nrepo = \"a/b\"\n");
+        assert_eq!(load(d.path(), None).unwrap().volume, VolumeSpec::default());
+        let d = dir_with(
+            "[burst]\nrepo = \"a/b\"\nvolume_gb = 750\nvolume_iops = 6000\nvolume_throughput_mbps = 1000\n",
+        );
+        let v = load(d.path(), None).unwrap().volume;
+        assert_eq!(v, VolumeSpec::new(750, Some(6000), Some(1000)).unwrap());
+    }
+
+    /// A gp3 limit violation is a config error naming the key, not an EC2
+    /// error hours later at RunInstances.
+    #[test]
+    fn volume_out_of_range_is_a_config_error() {
+        let d = dir_with("[burst]\nrepo = \"a/b\"\nvolume_gb = 99999\n");
+        let e = load(d.path(), None).unwrap_err().to_string();
+        assert!(e.contains("volume_gb") && e.contains("burst.toml"), "{e}");
     }
 
     #[test]
