@@ -15,6 +15,7 @@ to any one repo — one invocation serves one repo; many repos use the tool.
 | `implementation-phases.md` | The four implementation phases and their verification gates. |
 | `design-proposal.md` | **The approved design.** Requirements, landscape verdict, full design, decision log, rollout plan, starting defaults. |
 | `research/` | Preserved research: the three original commissioned takes (`homelab-landscape.md`, `gha-ecosystem.md`, `first-principles-design.md`), the adversarial buy-vs-build review (`adversarial-runson-review.md`), and the OSS-only landscape sweep (`oss-landscape-sweep.md`). The design proposal supersedes all of them where they disagree. |
+| `docs/runner-contract.md` | **For consuming repos.** What a job can rely on: disk, timeouts, credentials, the `provision` key. |
 | `docs/phase-4-findings.md` | First real burst vs. serial baseline: measured speedup, cost, per-phase latency. |
 
 ## Quickstart
@@ -34,10 +35,14 @@ export BURST_GITHUB_TOKEN=<fine-grained PAT, Administration read/write on the ta
 ```toml
 [burst]
 repo = "owner/repo"
+volume_gb = 750   # optional; default 100. Disk-heavy jobs raise this.
 ```
 
 Then: `burst bake` (once, cached after) → `burst up --auto` (or `burst up N`) → `burst status` →
 fleet self-terminates → `burst sweep` reaps stragglers.
+
+What a job gets — one VM per job, a single sized gp3 root volume, the two timeout layers, and the
+`provision` hook for extra packages — is `docs/runner-contract.md`.
 
 Status: **v0.1.0 released**, phases 0–4 complete. Phase 4 measured a real burst: 2.68x speedup at
 essentially equal cost to serial (`docs/phase-4-findings.md`).

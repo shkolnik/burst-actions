@@ -54,8 +54,13 @@ instance_type = "c7i.2xlarge"   # default; smallest type that exercises the path
 max_fleet = 12                  # default
 idle_timeout_min = 10           # default
 ttl_hours = 6                   # default
-# region, arch, base_ami, provision, budget_alarm_usd — see src/config.rs for the full set
+volume_gb = 100                 # default; root gp3 volume, the VM's only disk
+# region, arch, base_ami, provision, volume_iops, volume_throughput_mbps,
+# budget_alarm_usd — see src/config.rs for the full set
 ```
+
+What a consuming repo can rely on from a runner — disk contract, timeout semantics, the
+`provision` key — is `docs/runner-contract.md`; keep it true when behaviour changes.
 
 Flow: `burst bake` (builds the AMI once, cached after) → `burst up --auto` (sizes the fleet from
 queued burst-labeled jobs; `burst up N` for a fixed count) → `burst status` to watch → fleet
