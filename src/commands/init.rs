@@ -4,6 +4,7 @@
 
 use crate::config::{EXAMPLE, EXAMPLE_REPO_LINE};
 use crate::error::Error;
+use crate::github::RUNS_ON;
 use crate::schema::RepoId;
 use std::path::Path;
 
@@ -31,7 +32,9 @@ pub fn run(dir: &Path, repo: &str) -> Result<(), Error> {
         source,
     })?;
     println!(
-        "wrote {} for {repo}\nedit it (every setting is documented inline), then run `burst bake`",
+        "wrote {} for {repo}\n\
+         edit it (every setting is documented inline), then run `burst bake`\n\
+         jobs reach these runners with `{RUNS_ON}` in the workflow",
         path.display()
     );
     Ok(())

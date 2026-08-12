@@ -183,7 +183,8 @@ fn init_writes_a_config_in_an_unconfigured_directory() {
         .args(["init", "octo/widgets"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("burst bake"));
+        .stdout(predicate::str::contains("burst bake"))
+        .stdout(predicate::str::contains("runs-on: [self-hosted, burst]"));
     let written = std::fs::read_to_string(dir.path().join("burst.toml")).unwrap();
     assert!(written.contains("repo = \"octo/widgets\""), "{written}");
 }

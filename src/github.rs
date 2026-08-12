@@ -111,12 +111,20 @@ pub fn strip_release_tag(tag: &str) -> String {
     tag.strip_prefix('v').unwrap_or(tag).to_string()
 }
 
+/// The label a job must carry to reach a burst runner — and the label burst
+/// mints on every JIT registration. One constant so the workflow instructions,
+/// the registration, and the queue filter can never drift apart.
+pub const RUNNER_LABEL: &str = "burst";
+
+/// The line a consuming workflow needs, quoted verbatim by `burst init`.
+pub const RUNS_ON: &str = "runs-on: [self-hosted, burst]";
+
 /// Body for `POST .../actions/runners/generate-jitconfig`.
 pub fn jit_request_body(runner_name: &str) -> serde_json::Value {
     serde_json::json!({
         "name": runner_name,
         "runner_group_id": 1,
-        "labels": ["self-hosted", "burst"],
+        "labels": ["self-hosted", RUNNER_LABEL],
         "work_folder": "_work",
     })
 }
@@ -159,7 +167,7 @@ pub fn count_queued_burst_jobs(jobs_response: &serde_json::Value) -> u32 {
                 .filter(|j| {
                     j["labels"]
                         .as_array()
-                        .is_some_and(|ls| ls.iter().any(|l| l.as_str() == Some("burst")))
+                        .is_some_and(|ls| ls.iter().any(|l| l.as_str() == Some(RUNNER_LABEL)))
                 })
                 .count() as u32
         })
@@ -726,6 +734,16 @@ mod tests {
         assert_eq!(obj["name"], "burst-runner-abc");
         assert_eq!(obj["runner_group_id"], 1);
         assert_eq!(obj["labels"], serde_json::json!(["self-hosted", "burst"]));
+        // The label a user must type in their workflow is the label we mint:
+        // RUNS_ON is what `burst init` and the config template quote.
+        assert!(RUNS_ON.contains(RUNNER_LABEL), "{RUNS_ON}");
+        assert!(
+            obj["labels"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|l| l.as_str() == Some(RUNNER_LABEL))
+        );
         assert_eq!(obj["work_folder"], "_work");
     }
 

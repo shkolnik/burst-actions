@@ -56,8 +56,12 @@ fails if a setting exists in the code but not here).
 #
 # `repo` is the only required setting. Every other line is commented out and
 # shows the default burst uses when you leave it that way; uncomment (drop the
-# leading `#`) to change one. What a job can rely on from a runner is
-# documented in docs/runner-contract.md.
+# leading `#`) to change one.
+#
+# A job reaches these runners by asking for them in the workflow:
+#     runs-on: [self-hosted, burst]
+# What that job can then rely on — disk, timeouts, credentials — is
+# https://github.com/shkolnik/burst-actions/blob/main/docs/runner-contract.md
 
 [burst]
 # The repository whose queued jobs this fleet serves. Required; `--repo` on the
@@ -82,8 +86,8 @@ repo = "owner/repo"
 
 # ---- disk -------------------------------------------------------------------
 # The VM has one gp3 root volume; the job workspace and the container data root
-# both live on it. See docs/runner-contract.md for the guarantee and how to
-# assert it from a job.
+# both live on it. The runner-contract link above documents the guarantee and
+# how to assert it from a job.
 
 # Root volume size in GiB (gp3: 1-16384). Size for your job's measured peak
 # plus headroom.
@@ -110,8 +114,8 @@ repo = "owner/repo"
 
 # ---- image ------------------------------------------------------------------
 
-# Base AMI to bake from. Required in practice: `burst bake` refuses to guess and
-# prints the exact line to paste, so bake once and copy its suggestion here.
+# Base AMI to bake from. Never guessed: `burst bake` fails with the exact line
+# to paste here, so run it once and copy that line in.
 #base_ami = "ami-0703709356caf3a36"
 
 # Shell script appended to burst's provisioning script and run as root at bake

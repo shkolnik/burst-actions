@@ -206,6 +206,10 @@ mod tests {
             "template must carry the placeholder line `burst init` rewrites"
         );
         assert!(
+            EXAMPLE.contains(crate::github::RUNS_ON),
+            "the template must name the label a job needs to reach these runners"
+        );
+        assert!(
             include_str!("../README.md").contains(EXAMPLE.trim_end()),
             "README's configuration block has drifted from config.example.toml"
         );

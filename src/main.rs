@@ -5,7 +5,10 @@ use std::process::ExitCode;
 #[command(
     name = "burst",
     version,
-    about = "Ephemeral cloud VMs as GitHub Actions runners"
+    about = "Ephemeral cloud VMs as GitHub Actions runners",
+    long_about = "Ephemeral cloud VMs as GitHub Actions runners.\n\n                  Launches EC2 instances that each run exactly one queued job and terminate. \
+                  Needs AWS credentials from the usual chain (env vars, profile, SSO) and a \
+                  GitHub PAT; jobs reach these runners with `runs-on: [self-hosted, burst]`."
 )]
 struct Cli {
     /// Target GitHub repository as owner/repo (overrides burst.toml)
@@ -23,7 +26,7 @@ enum Cmd {
         /// Number of VMs to launch
         #[arg(group = "count_source")]
         n: Option<u32>,
-        /// Size the fleet from the queued burst-labeled jobs
+        /// Size the fleet from queued jobs labeled `burst`
         #[arg(long, group = "count_source")]
         auto: bool,
         /// Use spot instances
@@ -41,16 +44,17 @@ enum Cmd {
         /// Target GitHub repository as owner/repo
         repo: String,
     },
-    /// Build or rebuild the runner AMI
+    /// Build the runner AMI now; `burst up` builds it on demand anyway
     Bake,
-    /// Show live fleet state (cloud truth)
+    /// Show live fleet state, read from AWS rather than the local statefile
     Status,
     /// Terminate this repo's fleet
     Down {
+        /// Skip the confirmation prompt (for automation)
         #[arg(long)]
         yes: bool,
     },
-    /// Reap expired instances, orphan schedules, dead registrations
+    /// Reap expired instances, orphaned kill schedules, stale runner registrations
     Sweep,
 }
 
@@ -59,7 +63,16 @@ fn main() -> ExitCode {
     // this directory still needs; a directory with nothing outstanding gets
     // the plain help.
     let cwd = std::env::current_dir();
-    let mut command = Cli::command();
+    // `--help` also states the prerequisites the Setup block cannot probe for
+    // (AWS credentials) and the one thing that must change in the consuming
+    // repo's workflow. The label comes from the same constant burst mints.
+    let mut command = Cli::command().long_about(format!(
+        "Ephemeral cloud VMs as GitHub Actions runners.\n\n\
+         Launches EC2 instances that each run exactly one queued job and terminate. Needs AWS \
+         credentials from the usual chain (env vars, profile, SSO) and a GitHub PAT. Jobs reach \
+         these runners with `{}` in the workflow.",
+        burst::github::RUNS_ON
+    ));
     if let Some(setup) = cwd.as_ref().ok().and_then(|d| burst::setup::probe(d)) {
         command = command.after_help(setup);
     }
