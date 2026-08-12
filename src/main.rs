@@ -36,6 +36,11 @@ enum Cmd {
         #[arg(long)]
         ssh_key: Option<String>,
     },
+    /// Write an annotated burst.toml into the current directory
+    Init {
+        /// Target GitHub repository as owner/repo
+        repo: String,
+    },
     /// Build or rebuild the runner AMI
     Bake,
     /// Show live fleet state (cloud truth)
@@ -59,6 +64,17 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // `init` is the one command that runs without a config — it writes one.
+    if let Cmd::Init { repo } = &cli.command {
+        return match burst::commands::init::run(&cwd, repo) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("error: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
+
     let config = match burst::config::load(&cwd, cli.repo.as_deref()) {
         Ok(c) => c,
         Err(e) => {
@@ -90,6 +106,8 @@ fn main() -> ExitCode {
                 ExitCode::FAILURE
             }
         },
+        // Handled before the config load above; the match must stay exhaustive.
+        Cmd::Init { .. } => ExitCode::SUCCESS,
         Cmd::Bake => match burst::commands::bake::run(&config) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {

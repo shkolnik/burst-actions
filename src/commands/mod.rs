@@ -5,6 +5,7 @@
 pub mod bake;
 pub mod down;
 pub mod image;
+pub mod init;
 pub mod status;
 pub mod sweep;
 pub mod up;

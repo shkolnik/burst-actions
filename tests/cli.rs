@@ -171,3 +171,19 @@ fn unknown_config_key_fails_loud() {
         .code(1)
         .stderr(predicate::str::contains("bogus"));
 }
+
+/// `init` is the only command that runs before a `burst.toml` exists — it must
+/// not trip the config load that every other command needs.
+#[test]
+fn init_writes_a_config_in_an_unconfigured_directory() {
+    let dir = tempfile::tempdir().unwrap();
+    Command::cargo_bin("burst")
+        .unwrap()
+        .current_dir(dir.path())
+        .args(["init", "octo/widgets"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("burst bake"));
+    let written = std::fs::read_to_string(dir.path().join("burst.toml")).unwrap();
+    assert!(written.contains("repo = \"octo/widgets\""), "{written}");
+}

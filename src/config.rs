@@ -10,23 +10,46 @@ struct FileConfig {
     burst: BurstTable,
 }
 
-#[derive(Debug, Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct BurstTable {
-    repo: Option<String>,
-    instance_type: Option<String>,
-    region: Option<String>,
-    max_fleet: Option<u32>,
-    idle_timeout_min: Option<u32>,
-    ttl_hours: Option<u32>,
-    arch: Option<String>,
-    base_ami: Option<String>,
-    provision: Option<PathBuf>,
-    budget_alarm_usd: Option<u32>,
-    volume_gb: Option<u32>,
-    volume_iops: Option<u32>,
-    volume_throughput_mbps: Option<u32>,
+/// The `[burst]` table and its key list from one declaration: a key cannot be
+/// added to the config without appearing in `KEYS`, which the example file is
+/// checked against. Every key is optional in the file; `load` supplies the
+/// defaults.
+macro_rules! burst_table {
+    ($($key:ident : $ty:ty),* $(,)?) => {
+        #[derive(Debug, Deserialize, Default)]
+        #[serde(deny_unknown_fields)]
+        struct BurstTable {
+            $( $key: Option<$ty>, )*
+        }
+
+        /// Every settable `burst.toml` key, in declaration order.
+        pub const KEYS: &[&str] = &[$(stringify!($key)),*];
+    };
 }
+
+burst_table! {
+    repo: String,
+    instance_type: String,
+    region: String,
+    max_fleet: u32,
+    idle_timeout_min: u32,
+    ttl_hours: u32,
+    arch: String,
+    base_ami: String,
+    provision: PathBuf,
+    budget_alarm_usd: u32,
+    volume_gb: u32,
+    volume_iops: u32,
+    volume_throughput_mbps: u32,
+}
+
+/// The annotated template shipped with the tool, written by `burst init` and
+/// quoted verbatim in the README. Tests keep all three in step.
+pub const EXAMPLE: &str = include_str!("../config.example.toml");
+
+/// The line `burst init` rewrites with the caller's repo. A template edit that
+/// loses it is a test failure, not a silently repo-less `burst.toml`.
+pub const EXAMPLE_REPO_LINE: &str = "repo = \"owner/repo\"";
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -136,6 +159,56 @@ mod tests {
         assert_eq!(c.arch, Arch::X86_64);
         assert!(c.region.is_none() && c.base_ami.is_none() && c.provision.is_none());
         assert!(c.budget_alarm_usd.is_none());
+    }
+
+    /// The template's toggle convention: `#key = value` (no space after the
+    /// `#`) is a commented-out setting, `# text` is prose. Uncommenting the
+    /// former turns the template into the maximal config it documents.
+    fn uncommented(example: &str) -> String {
+        example
+            .lines()
+            .map(|l| match l.strip_prefix('#') {
+                Some(rest) if !rest.starts_with(' ') && !rest.is_empty() => rest,
+                _ => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Drift guard, both directions. Uncommenting every documented setting
+    /// must produce a config that `load` accepts — which catches a key that no
+    /// longer exists (`deny_unknown_fields`), one whose type or allowed values
+    /// changed, and one whose documented value is invalid. Then every key the
+    /// code accepts must appear in the template.
+    #[test]
+    fn example_config_and_code_do_not_drift() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join("burst.toml"), uncommented(EXAMPLE)).unwrap();
+        let loaded = load(d.path(), None).expect("config.example.toml must load with all keys set");
+        assert_eq!(loaded.repo.to_string(), "owner/repo");
+
+        let table: toml::Table = toml::from_str(&uncommented(EXAMPLE)).unwrap();
+        let documented = table["burst"].as_table().unwrap();
+        for key in KEYS {
+            assert!(
+                documented.contains_key(*key),
+                "config.example.toml documents no `{key}` — add it, or the key is undiscoverable"
+            );
+        }
+    }
+
+    /// `burst init` rewrites exactly this line; the README quotes the template
+    /// verbatim. Both break silently if the template drifts from them.
+    #[test]
+    fn example_config_is_quoted_and_rewritable() {
+        assert!(
+            EXAMPLE.contains(&format!("\n{EXAMPLE_REPO_LINE}\n")),
+            "template must carry the placeholder line `burst init` rewrites"
+        );
+        assert!(
+            include_str!("../README.md").contains(EXAMPLE.trim_end()),
+            "README's configuration block has drifted from config.example.toml"
+        );
     }
 
     #[test]
