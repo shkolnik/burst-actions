@@ -44,20 +44,11 @@ export BURST_GITHUB_TOKEN=<fine-grained PAT, Administration read/write on the ta
 # AWS credentials: standard env vars / profile / SSO, whatever your shell already uses
 ```
 
-`burst.toml` in the repo you're bursting for (all keys optional except `repo`, which `--repo` can
-supply instead):
-
-```toml
-[burst]
-repo = "owner/repo"
-instance_type = "c7i.2xlarge"   # default; smallest type that exercises the path when testing
-max_fleet = 12                  # default
-idle_timeout_min = 10           # default
-ttl_hours = 6                   # default
-volume_gb = 100                 # default; root gp3 volume, the VM's only disk
-# region, arch, base_ami, provision, volume_iops, volume_throughput_mbps,
-# budget_alarm_usd — see src/config.rs for the full set
-```
+`burst init owner/repo` in the repo you're bursting for writes an annotated `burst.toml`; `repo`
+is the only required key, and `--repo` can supply it instead. Every setting lives in
+`config.example.toml` with its default and a description — **add a new key there in the same
+commit that adds it to `config.rs`**, or the drift test fails (it also guards the README's copy).
+When testing, override `instance_type` with the smallest type that exercises the path.
 
 What a consuming repo can rely on from a runner — disk contract, timeout semantics, the
 `provision` key — is `docs/runner-contract.md`; keep it true when behaviour changes.

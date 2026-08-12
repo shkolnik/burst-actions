@@ -13,6 +13,10 @@ tag where the action supports tag conditions, by the `burst-actions-*` name pref
 (IAM, Scheduler, Budgets). Reads that AWS cannot resource-scope (`Describe*`) are the only `*`
 resources.
 
+Sizing the root volume (`volume_gb` and friends) needs no policy change: it is the same
+`RunInstances` call with a block-device mapping, and the volume still carries the request tag
+`LaunchTaggedOnly` requires. Verified live at 750 GiB on 2026-08-12.
+
 ```json
 {
   "Version": "2012-10-17",
