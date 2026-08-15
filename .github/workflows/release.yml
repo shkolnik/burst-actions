@@ -25,7 +25,7 @@ jobs:
           ref: ${{ inputs.tag || github.ref_name }}
       - run: cargo build --release --locked
       - run: cp target/release/burst burst-linux-x86_64
-      - uses: actions/attest-build-provenance@v3
+      - uses: actions/attest-build-provenance@v4
         with:
           subject-path: burst-linux-x86_64
       - name: upload to release
