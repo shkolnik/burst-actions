@@ -24,7 +24,7 @@ aws-sdk-budgets = { version = "1", default-features = false, features = ["rt-tok
 aws-sdk-sts = { version = "1", default-features = false, features = ["rt-tokio"] }
 aws-smithy-types = "1"
 ureq = { version = "3", features = ["json"] }
-base64 = "0.22"
+base64 = "0.23"
 ctrlc = "3"
 aws-sdk-servicequotas = { version = "1", default-features = false, features = ["rt-tokio"] }
 
